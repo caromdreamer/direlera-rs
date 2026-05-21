@@ -29,42 +29,90 @@ Direlera-rs is an experimental attempt to reimplement the Kaillera server protoc
 
 ## Getting Started
 
-### Prerequisites
+### Option 1: Download Pre-built Binary (Recommended — No Rust needed)
 
-- Rust 1.70 or higher (install: https://rustup.rs/)
+Download the latest binary directly from the [Releases page](https://github.com/yourusername/direlera-rs/releases) and run it:
 
-### Running the Server
+```bash
+# Download (replace vX.Y.Z with the latest version)
+wget https://github.com/yourusername/direlera-rs/releases/download/vX.Y.Z/direlera-rs-linux-x86_64.tar.gz
+tar -xzf direlera-rs-linux-x86_64.tar.gz
+cd direlera-rs
+./direlera-rs
+```
 
-1. **Download from Releases** (Recommended)
+---
 
-   Download the latest version from the [Releases page](https://github.com/yourusername/direlera-rs/releases).
+### Option 2: Build from Source
 
-   ```bash
-   # After extracting
-   cd direlera-rs
-   ./direlera-rs  # Linux/macOS
-   direlera-rs.exe  # Windows
-   ```
+If no pre-built binary is available for your platform, or you prefer to build yourself, follow the steps below.
+You do **not** need any prior Rust knowledge — just copy and paste the commands.
 
-2. **Build from Source**
+#### Step 1 — Install system dependencies
 
-   ```bash
-   git clone https://github.com/yourusername/direlera-rs.git
-   cd direlera-rs
-   cargo build --release
-   ./target/release/direlera-rs
-   ```
+**Ubuntu / Debian:**
 
-3. **Run in Development Mode**
+```bash
+sudo apt update
+sudo apt install -y curl git build-essential
+```
 
-   ```bash
-   cargo run
-   ```
+**Fedora / RHEL / CentOS:**
 
-The server runs on the following ports by default:
+```bash
+sudo dnf install -y curl git gcc
+```
 
-- **Main Port**: 8080 (game logic)
-- **Control Port**: 27888 (initial connection and ping)
+**Arch Linux:**
+
+```bash
+sudo pacman -S --needed curl git base-devel
+```
+
+#### Step 2 — Install the Rust toolchain
+
+Rust is installed through a tool called `rustup`. Run the following command, press **Enter** when prompted, and let the installer finish:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+```
+
+After the installer completes, reload your shell environment so that the `cargo` command becomes available:
+
+```bash
+source "$HOME/.cargo/env"
+```
+
+Verify the installation:
+
+```bash
+cargo --version   # should print something like: cargo 1.XX.X
+```
+
+#### Step 3 — Clone and build
+
+```bash
+git clone https://github.com/yourusername/direlera-rs.git
+cd direlera-rs
+cargo build --release
+```
+
+The build may take a few minutes on the first run. When it finishes, the binary is at `target/release/direlera-rs`.
+
+#### Step 4 — Run the server
+
+```bash
+./target/release/direlera-rs
+```
+
+---
+
+### Default Ports
+
+The server listens on the following ports by default:
+
+- **Control Port**: 27888 UDP (initial connection and ping)
+- **Game Port**: 8080 UDP (game logic)
 
 ## Wireshark Dissector Setup
 
