@@ -206,7 +206,7 @@ async fn handle_session(
 
                     debug!({ fields::PACKET_SIZE } = data.len(), "Received packet");
 
-                    // Process the packet
+                    global_state.update_client_activity(&addr).await;
                     crate::process_packet_in_session(data, addr, global_state.clone(), &mut packet_counter).await;
                 }
                 Ok(None) => {

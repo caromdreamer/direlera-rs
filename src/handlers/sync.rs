@@ -47,26 +47,21 @@ pub async fn handle_game_data(
         "Player sent game data"
     );
 
-    // Process with SimpleGameSync
-    let outputs = {
-        let mut games = state.games.write().await;
-        let game_info = games
-            .get_mut(&game_id)
-            .ok_or_else(|| eyre!("Game not found"))?;
-
-        let sync_manager = game_info
-            .sync_manager
-            .as_mut()
-            .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
-
-        // Process input using CachedGameSync
-        sync_manager
-            .process_client_input(
-                player_id,
-                simplest_game_sync::ClientInput::GameData(game_data),
-            )
-            .map_err(|e| eyre!("Game sync error: {}", e))?
-    };
+    // Process with SimpleGameSync (per-game lock — does not block other games)
+    let outputs = state
+        .update_game(game_id, |game_info| {
+            let sync_manager = game_info
+                .sync_manager
+                .as_mut()
+                .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
+            sync_manager
+                .process_client_input(
+                    player_id,
+                    simplest_game_sync::ClientInput::GameData(game_data),
+                )
+                .map_err(|e| eyre!("Game sync error: {}", e))
+        })
+        .await?;
 
     // Send outputs to respective players
     let game_info = state
@@ -136,26 +131,21 @@ pub async fn handle_game_cache(
         .position(|p| p.addr == *src)
         .ok_or_else(|| eyre!("Player not in game"))?;
 
-    // Process with SimpleGameSync
-    let outputs = {
-        let mut games = state.games.write().await;
-        let game_info = games
-            .get_mut(&game_id)
-            .ok_or_else(|| eyre!("Game not found"))?;
-
-        let sync_manager = game_info
-            .sync_manager
-            .as_mut()
-            .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
-
-        // Process input using CachedGameSync
-        sync_manager
-            .process_client_input(
-                player_id,
-                simplest_game_sync::ClientInput::GameCache(cache_position),
-            )
-            .map_err(|e| eyre!("Game sync error: {}", e))?
-    };
+    // Process with SimpleGameSync (per-game lock — does not block other games)
+    let outputs = state
+        .update_game(game_id, |game_info| {
+            let sync_manager = game_info
+                .sync_manager
+                .as_mut()
+                .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
+            sync_manager
+                .process_client_input(
+                    player_id,
+                    simplest_game_sync::ClientInput::GameCache(cache_position),
+                )
+                .map_err(|e| eyre!("Game sync error: {}", e))
+        })
+        .await?;
 
     // Send outputs to respective players
     let game_info = state

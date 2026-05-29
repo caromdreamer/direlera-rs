@@ -526,19 +526,24 @@ pub async fn make_server_status(
 ) -> color_eyre::Result<Vec<u8>> {
     let addr_map = state.clients_by_addr.read().await;
     let id_map = state.clients_by_id.read().await;
-    let games_lock = state.games.read().await;
+
+    // Collect game Arcs while holding only a brief read lock on the HashMap
+    let (num_games, game_arcs) = {
+        let games_lock = state.games.read().await;
+        (
+            games_lock.len() as u32,
+            games_lock.values().cloned().collect::<Vec<_>>(),
+        )
+    };
 
     // Prepare response data
     let mut data = BytesMut::new();
     packet_util::put_empty_string(&mut data);
 
     // Number of users (excluding self)
-    // Safe: addr_map.len() is always >= 1 when this function is called (at least the caller exists)
     let num_users = addr_map.len().saturating_sub(1);
     data.put_u32_le(num_users as u32);
 
-    // Number of games
-    let num_games = games_lock.len() as u32;
     data.put_u32_le(num_games);
 
     // User list
@@ -554,8 +559,9 @@ pub async fn make_server_status(
         }
     }
 
-    // Game list
-    for game_info in games_lock.values() {
+    // Game list — lock each game independently
+    for game_arc in &game_arcs {
+        let game_info = game_arc.lock().await;
         packet_util::put_bytes_with_null(&mut data, &game_info.game_name);
         data.put_u32_le(game_info.game_id);
         packet_util::put_bytes_with_null(&mut data, &game_info.emulator_name);

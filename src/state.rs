@@ -2,11 +2,11 @@ use crate::simplest_game_sync;
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::atomic::{AtomicU16, AtomicU32, Ordering},
+    sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering},
     sync::Arc,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex as GameMutex, RwLock};
 use uuid::Uuid;
 
 type PlayerStatus = u8;
@@ -20,7 +20,7 @@ pub struct AppState {
     // RwLock: multiple readers, exclusive writer
     pub clients_by_addr: Arc<RwLock<HashMap<SocketAddr, Uuid>>>,
     pub clients_by_id: Arc<RwLock<HashMap<Uuid, ClientInfo>>>,
-    pub games: Arc<RwLock<HashMap<u32, GameInfo>>>,
+    pub games: Arc<RwLock<HashMap<u32, Arc<GameMutex<GameInfo>>>>>,
 
     // Atomic: lock-free counter increment
     pub next_game_id: Arc<AtomicU32>,
@@ -111,6 +111,43 @@ impl AppState {
         Some((old_addr, client))
     }
 
+    /// Read-only lookup of a client by username (does not remove).
+    pub async fn find_client_by_username(
+        &self,
+        username: &[u8],
+    ) -> Option<(SocketAddr, ClientInfo)> {
+        let (session_id, client) = {
+            let id_map = self.clients_by_id.read().await;
+            id_map
+                .iter()
+                .find(|(_, c)| c.username == username)
+                .map(|(id, c)| (*id, c.clone()))?
+        };
+
+        let addr_map = self.clients_by_addr.read().await;
+        let addr = addr_map
+            .iter()
+            .find(|(_, &v)| v == session_id)
+            .map(|(k, _)| *k)?;
+
+        Some((addr, client))
+    }
+
+    /// Update the last-activity timestamp for a client (lock-free after addr lookup).
+    pub async fn update_client_activity(&self, addr: &SocketAddr) {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let addr_map = self.clients_by_addr.read().await;
+        if let Some(&session_id) = addr_map.get(addr) {
+            let id_map = self.clients_by_id.read().await;
+            if let Some(client) = id_map.get(&session_id) {
+                client.last_activity_secs.store(secs, Ordering::Relaxed);
+            }
+        }
+    }
+
     // Get all client addresses
     pub async fn get_all_client_addrs(&self) -> Vec<SocketAddr> {
         let addr_map = self.clients_by_addr.read().await;
@@ -120,30 +157,48 @@ impl AppState {
     // Game operations
     pub async fn add_game(&self, game_id: u32, game: GameInfo) {
         let mut games = self.games.write().await;
-        games.insert(game_id, game);
+        games.insert(game_id, Arc::new(GameMutex::new(game)));
     }
 
     pub async fn get_game(&self, game_id: u32) -> Option<GameInfo> {
-        let games = self.games.read().await;
-        games.get(&game_id).cloned()
+        let arc = {
+            let games = self.games.read().await;
+            games.get(&game_id)?.clone()
+        };
+        let guard = arc.lock().await;
+        Some(guard.clone())
     }
 
     pub async fn remove_game(&self, game_id: u32) -> Option<GameInfo> {
-        let mut games = self.games.write().await;
-        games.remove(&game_id)
+        let arc = {
+            let mut games = self.games.write().await;
+            games.remove(&game_id)?
+        };
+        let guard = arc.lock().await;
+        Some(guard.clone())
     }
 
+    /// Update a specific game under its own per-game lock (not the global HashMap lock).
+    /// Multiple games can be updated concurrently.
     pub async fn update_game<F, R, E>(&self, game_id: u32, f: F) -> Result<R, E>
     where
         F: FnOnce(&mut GameInfo) -> Result<R, E>,
     {
-        let mut games = self.games.write().await;
-        let game = games.get_mut(&game_id).ok_or_else(|| {
-            // This will be converted to the error type E by the caller
-            panic!("Game not found")
-        })?;
+        let arc = {
+            let games = self.games.read().await;
+            games
+                .get(&game_id)
+                .unwrap_or_else(|| panic!("Game not found: {}", game_id))
+                .clone()
+        };
+        let mut game = arc.lock().await;
+        f(&mut game)
+    }
 
-        f(game)
+    /// Get the per-game Arc<Mutex> for direct access patterns.
+    pub async fn get_game_arc(&self, game_id: u32) -> Option<Arc<GameMutex<GameInfo>>> {
+        let games = self.games.read().await;
+        games.get(&game_id).cloned()
     }
 
     pub async fn update_client<F, R, E>(&self, addr: &SocketAddr, f: F) -> Result<R, E>
@@ -180,7 +235,8 @@ pub struct ClientInfo {
     pub last_ping_time: Option<Instant>, // Timestamp when SERVER_TO_CLIENT_ACK was sent (for RTT measurement)
     pub ack_count: u16,
     pub ping_samples: Vec<u32>, // Recent RTT measurements for averaging (max 5, excluding first measurement)
-    //////////////////
+    /// Unix timestamp (seconds) of the last received packet — updated lock-free
+    pub last_activity_secs: Arc<AtomicU64>,
     /// Packet generator for this client (handles sequence numbers and redundancy)
     pub packet_generator: crate::kaillera::protocol::UDPPacketGenerator,
 }

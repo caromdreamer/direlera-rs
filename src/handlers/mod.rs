@@ -15,7 +15,7 @@ use crate::*;
 // For tracing, all arguments except those listed in skip() will be captured.
 // Always use English comments.
 // Only skip 'state' and 'message' in tracing, do not skip 'src' so that 'src' appears in tracing logs.
-#[instrument(skip(state, message))]
+#[instrument(level = "debug", skip(state, message))]
 pub async fn handle_message(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,

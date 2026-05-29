@@ -287,32 +287,29 @@ pub async fn handle_quit_game(
     let _ = execute_drop_game(game_id, src, &state).await;
 
     // Extract necessary information and remove player from game
-    let mut games_lock = state.games.write().await;
-    let game_info = match games_lock.get_mut(&game_id) {
-        Some(game_info) => game_info,
-        None => {
-            error!(
-                { fields::GAME_ID } = game_id,
-                "Game not found during game quit"
-            );
-            return Ok(());
+    let (owner_user_id, player_addrs, game_status, max_players, num_players) = {
+        let game_arc = match state.get_game_arc(game_id).await {
+            Some(arc) => arc,
+            None => {
+                error!(
+                    { fields::GAME_ID } = game_id,
+                    "Game not found during game quit"
+                );
+                return Ok(());
+            }
+        };
+        let mut game_info = game_arc.lock().await;
+        let owner_user_id = game_info.owner_user_id;
+        let player_addrs: Vec<_> = game_info.players.iter().map(|p| p.addr).collect();
+        let game_status = game_info.game_status;
+        let max_players = game_info.max_players;
+        if let Some(idx) = game_info.players.iter().position(|p| p.addr == *src) {
+            game_info.players.remove(idx);
+            game_info.num_players -= 1;
         }
+        let num_players = game_info.num_players;
+        (owner_user_id, player_addrs, game_status, max_players, num_players)
     };
-
-    // Store necessary info before modifying
-    let owner_user_id = game_info.owner_user_id;
-    let player_addrs: Vec<_> = game_info.players.iter().map(|p| p.addr).collect();
-    let game_status = game_info.game_status;
-    let max_players = game_info.max_players;
-
-    // Remove from players
-    if let Some(idx) = game_info.players.iter().position(|p| p.addr == *src) {
-        game_info.players.remove(idx);
-        game_info.num_players -= 1;
-    }
-
-    let num_players = game_info.num_players;
-    drop(games_lock); // Release lock early
 
     // Remove client from game
     util::with_client_mut(&state, src, |client_info| {
@@ -567,22 +564,18 @@ pub async fn execute_drop_game(
 
     // Validate game is playing and get dropper info
     let dropper_player_id = {
-        let games = state.games.read().await;
-        let game_info = match games.get(&game_id) {
-            Some(game_info) => game_info,
+        let game_arc = match state.get_game_arc(game_id).await {
+            Some(arc) => arc,
             None => {
                 debug!("Game not found during drop game, ignoring");
                 return Ok(false);
             }
         };
-
-        // Check if game is actually playing
+        let game_info = game_arc.lock().await;
         if game_info.game_status != GAME_STATUS_PLAYING {
             info!("Game is not playing, skipping drop game");
             return Ok(false);
         }
-
-        // Find dropper's player_id
         match game_info.players.iter().position(|p| p.addr == *src) {
             Some(player_id) => player_id,
             None => {
@@ -592,12 +585,13 @@ pub async fn execute_drop_game(
         }
     };
 
-    // Mark player as dropped and get all necessary data (in one lock)
+    // Mark player as dropped and get all necessary data
     let (outputs, players, _all_dropped) = {
-        let mut games = state.games.write().await;
-        let game_info = games
-            .get_mut(&game_id)
+        let game_arc = state
+            .get_game_arc(game_id)
+            .await
             .ok_or_else(|| eyre!("Game not found"))?;
+        let mut game_info = game_arc.lock().await;
 
         info!(
             { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
@@ -624,7 +618,7 @@ pub async fn execute_drop_game(
 
         if all_dropped {
             game_info.game_status = GAME_STATUS_WAITING;
-            let status_data = util::make_update_game_status(game_info)?;
+            let status_data = util::make_update_game_status(&*game_info)?;
             util::broadcast_packet(state, msg::UPDATE_GAME_STATUS, status_data).await?;
             game_info.sync_manager = None;
         }
@@ -823,17 +817,8 @@ pub async fn handle_kick_user(
     };
 
     let game_info_clone = {
-        let mut games_lock = state.games.write().await;
-        let game_info = games_lock.get_mut(&game_id);
-        match game_info {
-            Some(game_info) => {
-                // Remove from players
-                if let Some(idx) = game_info.players.iter().position(|p| p.addr == client_addr) {
-                    game_info.players.remove(idx);
-                    game_info.num_players -= 1;
-                }
-                game_info.clone()
-            }
+        let game_arc = match state.get_game_arc(game_id).await {
+            Some(arc) => arc,
             None => {
                 error!(
                     { fields::GAME_ID } = game_id,
@@ -841,7 +826,13 @@ pub async fn handle_kick_user(
                 );
                 return Ok(());
             }
+        };
+        let mut game_info = game_arc.lock().await;
+        if let Some(idx) = game_info.players.iter().position(|p| p.addr == client_addr) {
+            game_info.players.remove(idx);
+            game_info.num_players -= 1;
         }
+        game_info.clone()
     };
 
     info!(
