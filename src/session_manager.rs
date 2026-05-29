@@ -189,6 +189,9 @@ async fn handle_session(
     async move {
         info!("Session handler started");
 
+        // Per-session packet counter — no global lock needed
+        let mut packet_counter: u16 = 0;
+
         // Session loop - similar to TCP recv loop
         loop {
             match timeout(SESSION_TIMEOUT, rx.recv()).await {
@@ -204,7 +207,7 @@ async fn handle_session(
                     debug!({ fields::PACKET_SIZE } = data.len(), "Received packet");
 
                     // Process the packet
-                    crate::process_packet_in_session(data, addr, global_state.clone()).await;
+                    crate::process_packet_in_session(data, addr, global_state.clone(), &mut packet_counter).await;
                 }
                 Ok(None) => {
                     info!("Session channel closed");
