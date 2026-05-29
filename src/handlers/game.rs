@@ -624,7 +624,7 @@ pub async fn execute_drop_game(
 
         if all_dropped {
             game_info.game_status = GAME_STATUS_WAITING;
-            let status_data = util::make_update_game_status(&*game_info)?;
+            let status_data = util::make_update_game_status(&game_info)?;
             util::broadcast_packet(state, msg::UPDATE_GAME_STATUS, status_data).await?;
             game_info.sync_manager = None;
         }
