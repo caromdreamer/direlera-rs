@@ -131,6 +131,9 @@ async fn main() -> color_eyre::Result<()> {
 
     init_logger(log_format, log_level);
 
+    let git_commit = std::env::var("GIT_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    info!(git_commit = git_commit.as_str(), "Server starting");
+
     info!(
         { fields::CONFIG_SOURCE } = "config.toml",
         { fields::PORT } = config.main_port,
