@@ -63,11 +63,11 @@ impl Default for TracingConfig {
 }
 
 fn default_main_port() -> u16 {
-    27888
+    8080
 }
 
 fn default_sub_port() -> u16 {
-    8080
+    27888
 }
 
 fn default_format() -> String {
@@ -263,40 +263,35 @@ pub struct Message {
     pub addr: std::net::SocketAddr,
 }
 
-/// Process a single packet within a session
+/// Process a single packet within a session.
+/// `packet_counter` is per-session local state tracking the next expected message number.
 async fn process_packet_in_session(
     data: Vec<u8>,
     addr: std::net::SocketAddr,
     global_state: Arc<AppState>,
+    packet_counter: &mut u16,
 ) {
     debug!("Processing packet");
 
-    // Parse and handle messages
     match parse_packet(&data) {
         Ok(messages) => {
             for message in messages.iter() {
-                // 0 is special case, it means the first message
+                // Message number 0 signals the start of a new sequence
                 if message.message_number == 0 && messages.len() == 1 {
-                    global_state.packet_peeker.write().await.insert(addr, 0);
+                    *packet_counter = 0;
                 }
             }
 
             for message in messages {
-                let mut packet_peeker_lock = global_state.packet_peeker.write().await;
-                let message_number_to_process = *packet_peeker_lock.get(&addr).unwrap_or(&0);
+                let message_number_to_process = *packet_counter;
 
                 if message.message_number == message_number_to_process {
-                    // Update message number before processing to release lock quickly
-                    packet_peeker_lock.insert(addr, message_number_to_process + 1);
-                    drop(packet_peeker_lock); // Explicitly release lock before long operation
+                    *packet_counter = message_number_to_process + 1;
 
-                    // Save message_number before moving message
                     let msg_number = message.message_number;
                     let msg_type = message.message_type;
 
-                    // Handle message and log errors without crashing
                     if let Err(e) = handle_message(message, &addr, global_state.clone()).await {
-                        // Use Debug format to include error chain and context
                         error!(
                             { fields::MESSAGE_NUMBER } = msg_number,
                             { fields::MESSAGE_TYPE } = format!("0x{:02X}", msg_type),
@@ -309,7 +304,6 @@ async fn process_packet_in_session(
             }
         }
         Err(e) => {
-            // Log first few bytes for debugging
             let preview = if !data.is_empty() {
                 format!("{:02x?}", &data[..data.len().min(20)])
             } else {

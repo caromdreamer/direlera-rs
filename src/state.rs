@@ -21,7 +21,6 @@ pub struct AppState {
     pub clients_by_addr: Arc<RwLock<HashMap<SocketAddr, Uuid>>>,
     pub clients_by_id: Arc<RwLock<HashMap<Uuid, ClientInfo>>>,
     pub games: Arc<RwLock<HashMap<u32, GameInfo>>>,
-    pub packet_peeker: Arc<RwLock<HashMap<SocketAddr, u16>>>,
 
     // Atomic: lock-free counter increment
     pub next_game_id: Arc<AtomicU32>,
@@ -39,7 +38,6 @@ impl AppState {
             clients_by_addr: Arc::new(RwLock::new(HashMap::new())),
             clients_by_id: Arc::new(RwLock::new(HashMap::new())),
             games: Arc::new(RwLock::new(HashMap::new())),
-            packet_peeker: Arc::new(RwLock::new(HashMap::new())),
             next_game_id: Arc::new(AtomicU32::new(1)),
             next_user_id: Arc::new(AtomicU16::new(1)),
             tx,
@@ -81,6 +79,36 @@ impl AppState {
 
         let mut id_map = self.clients_by_id.write().await;
         id_map.remove(&session_id)
+    }
+
+    /// Find and remove any existing client with the same username.
+    /// Used to evict stale sessions when a user reconnects from a new address.
+    pub async fn remove_client_by_username(
+        &self,
+        username: &[u8],
+    ) -> Option<(SocketAddr, ClientInfo)> {
+        let session_id = {
+            let id_map = self.clients_by_id.read().await;
+            id_map
+                .iter()
+                .find(|(_, c)| c.username == username)
+                .map(|(id, _)| *id)?
+        };
+
+        let old_addr = {
+            let mut addr_map = self.clients_by_addr.write().await;
+            let addr = addr_map
+                .iter()
+                .find(|(_, v)| **v == session_id)
+                .map(|(k, _)| *k)?;
+            addr_map.remove(&addr);
+            addr
+        };
+
+        let mut id_map = self.clients_by_id.write().await;
+        let client = id_map.remove(&session_id)?;
+
+        Some((old_addr, client))
     }
 
     // Get all client addresses
