@@ -308,7 +308,13 @@ pub async fn handle_quit_game(
             game_info.num_players -= 1;
         }
         let num_players = game_info.num_players;
-        (owner_user_id, player_addrs, game_status, max_players, num_players)
+        (
+            owner_user_id,
+            player_addrs,
+            game_status,
+            max_players,
+            num_players,
+        )
     };
 
     // Remove client from game
