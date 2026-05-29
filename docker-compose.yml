@@ -1,0 +1,9 @@
+services:
+  direlera:
+    image: ghcr.io/caromdreamer/direlera-rs:latest
+    restart: always
+    ports:
+      - "8080:8080/udp"
+      - "27888:27888/udp"
+    volumes:
+      - ./config.toml:/app/config.toml:ro
