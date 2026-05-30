@@ -5,7 +5,7 @@
 
 // logic description
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use tracing::warn;
 
@@ -34,6 +34,11 @@ pub enum ServerResponse {
 #[derive(Debug, Clone)]
 pub struct InputCache {
     slots: VecDeque<Vec<u8>>,
+    /// Maps data content → absolute indices where that data lives.
+    /// Multiple entries exist when the same data appears more than once.
+    index_map: HashMap<Vec<u8>, VecDeque<usize>>,
+    /// Monotonically increasing counter; next slot gets this index.
+    abs_tail: usize,
 }
 
 impl Default for InputCache {
@@ -46,28 +51,43 @@ impl InputCache {
     pub fn new() -> Self {
         Self {
             slots: VecDeque::with_capacity(256),
+            index_map: HashMap::new(),
+            abs_tail: 0,
         }
     }
 
-    /// Find data in cache, returning the position if found
+    /// Find data in cache, returning the logical position if found. O(1).
     pub fn find(&self, data: &[u8]) -> Option<u8> {
-        self.slots
-            .iter()
-            .enumerate()
-            .rev()
-            .find(|(_, cached)| cached.as_slice() == data)
-            .map(|(idx, _)| idx as u8)
+        let indices = self.index_map.get(data)?;
+        let &abs_last = indices.back()?;
+        let head = self.abs_tail - self.slots.len();
+        if abs_last >= head {
+            Some((abs_last - head) as u8)
+        } else {
+            None
+        }
     }
 
-    /// Add data to cache (rolls over at 256)
+    /// Add data to cache (evicts oldest slot when full).
     pub fn push(&mut self, data: Vec<u8>) {
         if self.slots.len() >= 256 {
-            self.slots.pop_front();
+            let evicted = self.slots.pop_front().unwrap();
+            if let Some(indices) = self.index_map.get_mut(&evicted) {
+                indices.pop_front();
+                if indices.is_empty() {
+                    self.index_map.remove(&evicted);
+                }
+            }
         }
+        self.index_map
+            .entry(data.clone())
+            .or_default()
+            .push_back(self.abs_tail);
+        self.abs_tail += 1;
         self.slots.push_back(data);
     }
 
-    /// Get data at position
+    /// Get data at logical position.
     pub fn get(&self, pos: u8) -> Option<&[u8]> {
         self.slots.get(pos as usize).map(|v| v.as_slice())
     }
@@ -272,23 +292,35 @@ impl SimplestGameSync {
         &self.player_delays
     }
 
-    /// Drain ready inputs (all players have input or are dropped) and process them
-    /// This can be called without new input to check if drop events allow sending data
+    /// Drain ready inputs (all players have input or are dropped) and process them.
+    ///
+    /// Capped at one "message worth" (max_delay frames) per call. This matches
+    /// EmuLinker-K's one-distribution-per-addData pacing: on lag recovery a player
+    /// sends catch-up packets rapidly, each triggering one cycle here, so the backlog
+    /// drains at the same real-world speed but output is spread across packets instead
+    /// of bursting all at once.
     pub fn drain_ready_inputs(&mut self) -> Result<Vec<PlayerOutput>, GameSyncError> {
         let mut results = Vec::new();
+        let players = self.player_delays.len();
+        let max_frames = self.player_delays.iter().copied().max().unwrap_or(1);
+        let mut frames_processed = 0;
 
-        // 모든 플레이어의 입력이 있는지 확인 (드롭된 플레이어 제외)
-        while {
+        loop {
+            if frames_processed >= max_frames {
+                break;
+            }
+
             let all_ready = self
                 .player_input
                 .iter()
                 .enumerate()
                 .all(|(i, buffer)| !buffer.is_empty() || self.dropped_players[i]);
             let has_any_input = self.player_input.iter().any(|buffer| !buffer.is_empty());
-            all_ready && has_any_input
-        } {
-            // 각 플레이어로부터 하나씩 입력 추출
-            // drop된 플레이어는 0으로 채운 데이터 생성
+
+            if !all_ready || !has_any_input {
+                break;
+            }
+
             let extract_inputs: Vec<OneInput> = self
                 .player_input
                 .iter_mut()
@@ -304,19 +336,15 @@ impl SimplestGameSync {
                 })
                 .collect();
 
-            // 모든 sender_buffer에 추출된 입력들을 추가
+            frames_processed += 1;
+
             for buffer in &mut self.sender_buffer {
                 buffer.extend(extract_inputs.clone());
             }
 
-            // 각 플레이어의 sender_buffer 확인 후 전송
-            let players = self.player_delays.len();
             for (pid, buffer) in self.sender_buffer.iter_mut().enumerate() {
-                // 필요한 개수 = delay * players (OneInput 개수)
                 let require_len = self.player_delays[pid] * players;
-
                 while buffer.len() >= require_len {
-                    // OneInput들을 drain해서 flatten
                     let output: Vec<u8> = buffer.drain(..require_len).flatten().collect();
                     results.push(PlayerOutput {
                         player_id: pid,

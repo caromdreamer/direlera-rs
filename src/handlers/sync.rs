@@ -131,21 +131,41 @@ pub async fn handle_game_cache(
         .position(|p| p.addr == *src)
         .ok_or_else(|| eyre!("Player not in game"))?;
 
-    // Process with SimpleGameSync (per-game lock — does not block other games)
-    let outputs = state
-        .update_game(game_id, |game_info| {
-            let sync_manager = game_info
-                .sync_manager
-                .as_mut()
-                .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
-            sync_manager
-                .process_client_input(
+    // Process with SimpleGameSync. Return GameSyncError directly so we can inspect
+    // the variant before converting to eyre (cache-miss needs a client notification).
+    let sync_result: Result<_, simplest_game_sync::GameSyncError> =
+        state
+            .update_game(game_id, |game_info| {
+                let sync_manager =
+                    game_info
+                        .sync_manager
+                        .as_mut()
+                        .ok_or(simplest_game_sync::GameSyncError::BufferInconsistency {
+                            message: "sync_manager not initialized".into(),
+                        })?;
+                sync_manager.process_client_input(
                     player_id,
                     simplest_game_sync::ClientInput::GameCache(cache_position),
                 )
-                .map_err(|e| eyre!("Game sync error: {}", e))
-        })
-        .await?;
+            })
+            .await;
+
+    let outputs = match sync_result {
+        Ok(outputs) => outputs,
+        Err(simplest_game_sync::GameSyncError::CachePositionNotFound { player_id, position }) => {
+            let data = packet_util::build_game_chat_packet(
+                b"Server",
+                b"Game Data Error! Game state will be inconsistent!",
+            );
+            util::send_packet(&state, src, msg::GAME_CHAT, data).await?;
+            return Err(eyre!(
+                "Cache miss: player {} position {} not found",
+                player_id,
+                position
+            ));
+        }
+        Err(e) => return Err(eyre!("Game sync error: {}", e)),
+    };
 
     // Send outputs to respective players
     let game_info = state
