@@ -134,7 +134,19 @@ async fn main() -> color_eyre::Result<()> {
     // Buckets in seconds. Without explicit buckets the exporter emits summary
     // type instead of histogram, which breaks histogram_quantile() in PromQL.
     let buckets = &[
-        0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0,
+        0.000005, // 5µs
+        0.00001,  // 10µs
+        0.00002,  // 20µs
+        0.00005,  // 50µs
+        0.0001,   // 100µs
+        0.0002,   // 200µs
+        0.0005,   // 500µs
+        0.001,    // 1ms
+        0.005,    // 5ms
+        0.01,     // 10ms
+        0.05,     // 50ms
+        0.1,      // 100ms
+        0.5,      // 500ms
     ];
     metrics_exporter_prometheus::PrometheusBuilder::new()
         .with_http_listener(([0, 0, 0, 0], 9091))
