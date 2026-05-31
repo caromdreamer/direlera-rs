@@ -246,8 +246,21 @@ async fn handle_session(
                 }
                 Err(_) => {
                     warn!(timeout_duration = ?SESSION_TIMEOUT, "Session timeout");
-                    // Notify lobby and perform quit if necessary before breaking
+                    use crate::kaillera::message_types as msg;
                     if let Some(client_info) = global_state.get_client(&addr).await {
+                        let username = crate::handlers::util::bytes_for_log(&client_info.username);
+                        // 글로벌 채팅으로 타임아웃 알림 (디버깅용)
+                        let notice =
+                            format!("[Server] {} timed out (keepalive not received)", username);
+                        let data =
+                            packet_util::build_global_chat_packet(b"Server", notice.as_bytes());
+                        let _ = crate::handlers::util::broadcast_packet(
+                            &global_state,
+                            msg::GLOBAL_CHAT,
+                            data,
+                        )
+                        .await;
+
                         if client_info.game_id.is_some() {
                             let _ = crate::handlers::game::handle_quit_game(
                                 vec![0x00, 0xFF, 0xFF],
@@ -257,7 +270,6 @@ async fn handle_session(
                             .await;
                         }
                         if let Some(removed) = global_state.remove_client(&addr).await {
-                            use crate::kaillera::message_types as msg;
                             let data = packet_util::build_user_quit_packet(
                                 &removed.username,
                                 removed.user_id,
@@ -270,6 +282,17 @@ async fn handle_session(
                             )
                             .await;
                         }
+                    } else {
+                        // 로그인 안 한 채 타임아웃 (주소만 알림)
+                        let notice = format!("[Server] {} timed out (no login)", addr);
+                        let data =
+                            packet_util::build_global_chat_packet(b"Server", notice.as_bytes());
+                        let _ = crate::handlers::util::broadcast_packet(
+                            &global_state,
+                            msg::GLOBAL_CHAT,
+                            data,
+                        )
+                        .await;
                     }
                     break;
                 }
