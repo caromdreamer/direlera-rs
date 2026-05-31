@@ -136,6 +136,9 @@ async fn main() -> color_eyre::Result<()> {
         .install()
         .expect("Failed to start Prometheus metrics exporter");
 
+    metrics::gauge!("active_sessions_total").set(0.0);
+    metrics::gauge!("active_games_total").set(0.0);
+
     let git_commit = std::env::var("GIT_COMMIT").unwrap_or_else(|_| "unknown".to_string());
     info!(git_commit = git_commit.as_str(), "Server starting");
 
