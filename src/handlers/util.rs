@@ -7,6 +7,12 @@ use crate::{packet_util, state, Message};
 
 use state::{AppState, ClientInfo, GameInfo};
 
+/// Record packet_processing_seconds histogram for a given message type.
+pub fn record_processing_time(msg_type: &'static str, elapsed: std::time::Duration) {
+    metrics::histogram!("packet_processing_seconds", "type" => msg_type)
+        .record(elapsed.as_secs_f64());
+}
+
 /// Record session context (username, session_id, game_id) onto the current span.
 /// Call this at the top of any handler after fetching ClientInfo.
 pub fn record_session_fields(client: &ClientInfo) {

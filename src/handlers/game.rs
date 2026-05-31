@@ -1,6 +1,7 @@
 use bytes::{Buf, BufMut, BytesMut};
 use color_eyre::eyre::eyre;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
 /// EmuLinker-K formula: frameDelay = (60 / conn_type) * (ping_ms / 1000) + 1
@@ -33,6 +34,7 @@ pub async fn handle_create_game(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     // Check if user is already in a game
     if let Some(client_info) = state.get_client(src).await {
         util::record_session_fields(&client_info);
@@ -139,7 +141,7 @@ pub async fn handle_create_game(
         util::build_join_game_response(&client_info)
     };
     util::send_packet(&state, src, msg::JOIN_GAME, response_data).await?;
-
+    util::record_processing_time("create_game", start.elapsed());
     Ok(())
 }
 
@@ -154,6 +156,7 @@ pub async fn handle_join_game(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     // Parse message
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = util::read_string_bytes(&mut buf);
@@ -245,7 +248,7 @@ pub async fn handle_join_game(
     // Send join game notification to ALL players (including the joining player)
     // Each player manages their own list, so we send the new player info to everyone
     util::broadcast_packet_to_game(&state, game_id, msg::JOIN_GAME, response_data).await?;
-
+    util::record_processing_time("join_game", start.elapsed());
     Ok(())
 }
 
@@ -284,6 +287,7 @@ pub async fn handle_quit_game(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     // Get client info and validate
     let client_info = match state.get_client(src).await {
         Some(client_info) => {
@@ -416,6 +420,7 @@ pub async fn handle_quit_game(
         let data = packet_util::build_quit_game_packet(&username, user_id);
         util::broadcast_packet_to_game(&state, game_id, msg::QUIT_GAME, data).await?;
     }
+    util::record_processing_time("quit_game", start.elapsed());
     Ok(())
 }
 
@@ -454,6 +459,7 @@ pub async fn handle_start_game(
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
     let mut buf = BytesMut::from(&message.data[..]);
+    let start = Instant::now();
     let _ = util::read_string_bytes(&mut buf); // Empty String
     let _ = buf.get_u32_le(); // 0xFFFF 0xFF 0xFF
 
@@ -592,6 +598,7 @@ pub async fn handle_start_game(
             packet_util::build_start_game_packet(player_delay as u16, player_number, total_players);
         util::send_packet(&state, &player.addr, msg::START_GAME, data).await?;
     }
+    util::record_processing_time("start_game", start.elapsed());
     Ok(())
 }
 
@@ -765,6 +772,7 @@ pub async fn handle_drop_game(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     debug!("Drop game request received");
 
     let client = state
@@ -777,7 +785,7 @@ pub async fn handle_drop_game(
         .ok_or_else(|| eyre!("Client not in a game"))?;
 
     execute_drop_game(game_id, src, &state).await?;
-
+    util::record_processing_time("drop_game", start.elapsed());
     Ok(())
 }
 
@@ -797,6 +805,7 @@ pub async fn handle_kick_user(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = util::read_string_bytes(&mut buf); // Empty String
     let user_id = buf.get_u16_le(); // UserID
@@ -934,6 +943,6 @@ pub async fn handle_kick_user(
     // Quit game notification
     let data = packet_util::build_quit_game_packet(&username, client_user_id);
     util::broadcast_packet_to_game(&state, game_id, msg::QUIT_GAME, data).await?;
-
+    util::record_processing_time("kick_user", start.elapsed());
     Ok(())
 }

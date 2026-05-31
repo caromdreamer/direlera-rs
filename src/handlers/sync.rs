@@ -114,7 +114,8 @@ pub async fn handle_game_data(
     }
 
     metrics::histogram!(
-        "game_sync_processing_seconds",
+        "packet_processing_seconds",
+        "type" => "game_data",
         "player_count" => game_info.players.len().to_string(),
     )
     .record(start.elapsed().as_secs_f64());
@@ -235,7 +236,8 @@ pub async fn handle_game_cache(
     }
 
     metrics::histogram!(
-        "game_sync_processing_seconds",
+        "packet_processing_seconds",
+        "type" => "game_data",
         "player_count" => game_info.players.len().to_string(),
     )
     .record(start.elapsed().as_secs_f64());
@@ -254,6 +256,7 @@ pub async fn handle_ready_to_play_signal(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     use tracing::info;
     debug!("Ready to play signal received");
     let mut buf = BytesMut::from(&message.data[..]);
@@ -325,5 +328,6 @@ pub async fn handle_ready_to_play_signal(
         util::broadcast_packet_to_game(&state, game_info_clone.game_id, msg::READY_TO_PLAY, data)
             .await?;
     }
+    util::record_processing_time("ready_to_play", start.elapsed());
     Ok(())
 }

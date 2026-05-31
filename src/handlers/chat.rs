@@ -2,6 +2,7 @@ use crate::*;
 use bytes::BytesMut;
 use color_eyre::eyre::{eyre, WrapErr};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::info;
 
 use super::util;
@@ -17,6 +18,7 @@ pub async fn handle_global_chat(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
 
     // NB: Empty String
@@ -40,7 +42,7 @@ pub async fn handle_global_chat(
     util::broadcast_packet(&state, msg::GLOBAL_CHAT, data)
         .await
         .wrap_err("Failed to broadcast global chat message")?;
-
+    util::record_processing_time("global_chat", start.elapsed());
     Ok(())
 }
 
@@ -55,6 +57,7 @@ pub async fn handle_game_chat(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
 
     // NB: Empty String
@@ -100,6 +103,6 @@ pub async fn handle_game_chat(
     util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, data)
         .await
         .wrap_err_with(|| format!("Failed to broadcast game chat to game {}", game_id))?;
-
+    util::record_processing_time("game_chat", start.elapsed());
     Ok(())
 }

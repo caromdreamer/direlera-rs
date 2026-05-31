@@ -21,6 +21,7 @@ pub async fn handle_user_login(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
 
     // NB: Username (read as bytes to preserve encoding)
@@ -116,7 +117,7 @@ pub async fn handle_user_login(
 
     // Send response
     util::send_packet(&state, src, msg::SERVER_TO_CLIENT_ACK, data).await?;
-
+    util::record_processing_time("user_login", start.elapsed());
     Ok(())
 }
 
@@ -136,6 +137,7 @@ pub async fn handle_user_quit(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     use tracing::debug;
     let mut buf = BytesMut::from(&message.data[..]);
 
@@ -168,5 +170,6 @@ pub async fn handle_user_quit(
             "Unknown client quit"
         );
     }
+    util::record_processing_time("user_quit", start.elapsed());
     Ok(())
 }
