@@ -2,8 +2,49 @@ services:
   direlera:
     image: ghcr.io/caromdreamer/direlera-rs:latest
     restart: always
+    pull_policy: always
     ports:
       - "8080:8080/udp"
       - "27888:27888/udp"
     volumes:
       - ./config.toml:/app/config.toml:ro
+
+  promtail:
+    image: grafana/promtail:3.4.3
+    container_name: promtail
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/lib/docker/containers:/var/lib/docker/containers:ro
+      - promtail_positions:/tmp
+    configs:
+      - source: promtail_config
+        target: /etc/promtail/config.yml
+    command: -config.file=/etc/promtail/config.yml
+    restart: unless-stopped
+
+configs:
+  promtail_config:
+    content: |
+      server:
+        http_listen_port: 9080
+        grpc_listen_port: 0
+
+      positions:
+        filename: /tmp/positions.yaml
+
+      clients:
+        - url: https://loki.funnify.org/loki/api/v1/push
+
+      scrape_configs:
+        - job_name: docker
+          docker_sd_configs:
+            - host: unix:///var/run/docker.sock
+              refresh_interval: 5s
+          relabel_configs:
+            - source_labels: [__meta_docker_container_name]
+              target_label: container
+            - source_labels: [__meta_docker_container_label_com_docker_compose_service]
+              target_label: service
+
+volumes:
+  promtail_positions:
