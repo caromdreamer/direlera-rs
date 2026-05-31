@@ -62,6 +62,25 @@ pub async fn handle_game_data(
     // Process with SimpleGameSync (per-game lock — does not block other games)
     let outputs = state
         .update_game(game_id, |game_info| {
+            // Jitter: consecutive inter-arrival time difference for this player
+            let now = Instant::now();
+            let player_count = game_info.players.len().to_string();
+            if let Some(player) = game_info.players.get_mut(player_id) {
+                if let Some(last_recv) = player.last_game_data_recv {
+                    let interval = now.duration_since(last_recv).as_secs_f64();
+                    if let Some(last_interval) = player.last_interval_secs {
+                        let jitter = (interval - last_interval).abs();
+                        metrics::histogram!(
+                            "game_data_jitter_seconds",
+                            "player_count" => player_count,
+                        )
+                        .record(jitter);
+                    }
+                    player.last_interval_secs = Some(interval);
+                }
+                player.last_game_data_recv = Some(now);
+            }
+
             let sync_manager = game_info
                 .sync_manager
                 .as_mut()

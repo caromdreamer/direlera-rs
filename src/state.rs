@@ -289,6 +289,10 @@ pub struct GamePlayerInfo {
     pub username: Vec<u8>, // Store as bytes to preserve original encoding
     pub user_id: u16,
     pub conn_type: u8,
+    /// Timestamp of last received game_data packet (for jitter calculation)
+    pub last_game_data_recv: Option<std::time::Instant>,
+    /// Most recent inter-arrival interval (for consecutive diff jitter)
+    pub last_interval_secs: Option<f64>,
 }
 
 impl GamePlayerInfo {

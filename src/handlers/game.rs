@@ -99,6 +99,8 @@ pub async fn handle_create_game(
             username: username.clone(),
             user_id,
             conn_type,
+            last_game_data_recv: None,
+            last_interval_secs: None,
         }],
     };
 
@@ -202,6 +204,8 @@ pub async fn handle_join_game(
                 username: username.clone(),
                 user_id,
                 conn_type,
+                last_game_data_recv: None,
+                last_interval_secs: None,
             });
         } else {
             debug!(
