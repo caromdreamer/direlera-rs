@@ -1,6 +1,7 @@
 use bytes::{Buf, BytesMut};
 use color_eyre::eyre::eyre;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 use super::util;
@@ -25,6 +26,7 @@ pub async fn handle_game_data(
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
     debug!("Game data received");
+    let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = buf.get_u8(); // Empty String
     let data_length = buf.get_u16_le() as usize;
@@ -111,6 +113,12 @@ pub async fn handle_game_data(
         util::send_packet(&state, &target_addr, message_type, data_to_send).await?;
     }
 
+    metrics::histogram!(
+        "game_sync_processing_seconds",
+        "player_count" => game_info.players.len().to_string(),
+    )
+    .record(start.elapsed().as_secs_f64());
+
     Ok(())
 }
 
@@ -126,6 +134,7 @@ pub async fn handle_game_cache(
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
     debug!("Game cache received");
+    let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = buf.get_u8(); // Empty String
     let cache_position = buf.get_u8();
@@ -224,6 +233,12 @@ pub async fn handle_game_cache(
         );
         util::send_packet(&state, &target_addr, message_type, data_to_send).await?;
     }
+
+    metrics::histogram!(
+        "game_sync_processing_seconds",
+        "player_count" => game_info.players.len().to_string(),
+    )
+    .record(start.elapsed().as_secs_f64());
 
     Ok(())
 }
