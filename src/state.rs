@@ -71,6 +71,8 @@ impl AppState {
 
         let mut addr_map = self.clients_by_addr.write().await;
         addr_map.insert(addr, session_id);
+
+        metrics::gauge!("active_sessions_total").increment(1.0);
     }
 
     pub async fn remove_client(&self, addr: &SocketAddr) -> Option<ClientInfo> {
@@ -78,7 +80,11 @@ impl AppState {
         let session_id = addr_map.remove(addr)?;
 
         let mut id_map = self.clients_by_id.write().await;
-        id_map.remove(&session_id)
+        let client = id_map.remove(&session_id);
+        if client.is_some() {
+            metrics::gauge!("active_sessions_total").decrement(1.0);
+        }
+        client
     }
 
     /// Find and remove any existing client with the same username.
@@ -108,6 +114,7 @@ impl AppState {
         let mut id_map = self.clients_by_id.write().await;
         let client = id_map.remove(&session_id)?;
 
+        metrics::gauge!("active_sessions_total").decrement(1.0);
         Some((old_addr, client))
     }
 
@@ -158,6 +165,7 @@ impl AppState {
     pub async fn add_game(&self, game_id: u32, game: GameInfo) {
         let mut games = self.games.write().await;
         games.insert(game_id, Arc::new(GameMutex::new(game)));
+        metrics::gauge!("active_games_total").increment(1.0);
     }
 
     pub async fn get_game(&self, game_id: u32) -> Option<GameInfo> {
@@ -174,6 +182,7 @@ impl AppState {
             let mut games = self.games.write().await;
             games.remove(&game_id)?
         };
+        metrics::gauge!("active_games_total").decrement(1.0);
         let guard = arc.lock().await;
         Some(guard.clone())
     }
