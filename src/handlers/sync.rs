@@ -286,7 +286,7 @@ pub async fn handle_ready_to_play_signal(
     }
 
     state
-        .update_client::<_, (), color_eyre::Report>(src, |client_info| {
+        .update_client(src, |client_info| {
             client_info.player_status = PLAYER_STATUS_NET_SYNC; // Ready to play
             Ok(())
         })
@@ -329,7 +329,7 @@ pub async fn handle_ready_to_play_signal(
     if all_user_ready_to_signal {
         for player in &game_info_clone.players {
             let _ = state
-                .update_client::<_, (), color_eyre::Report>(&player.addr, |client_info| {
+                .update_client(&player.addr, |client_info| {
                     client_info.player_status = PLAYER_STATUS_PLAYING;
                     Ok(())
                 })

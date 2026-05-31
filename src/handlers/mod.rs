@@ -64,7 +64,7 @@ pub async fn handle_client_to_server_ack(
     // Average of last 5 measurements, excluding the first measurement
     // and update ack count
     let ack_count = state
-        .update_client::<_, u16, color_eyre::Report>(src, |client_info| {
+        .update_client(src, |client_info| {
             if let Some(last_ping_time) = client_info.last_ping_time {
                 // Calculate round-trip time (RTT) from when we sent SERVER_TO_CLIENT_ACK
                 let current_rtt = last_ping_time.elapsed().as_millis() as u32;

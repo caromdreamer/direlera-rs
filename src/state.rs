@@ -210,21 +210,22 @@ impl AppState {
         games.get(&game_id).cloned()
     }
 
-    pub async fn update_client<F, R, E>(&self, addr: &SocketAddr, f: F) -> Result<R, E>
+    pub async fn update_client<F, R>(&self, addr: &SocketAddr, f: F) -> color_eyre::Result<R>
     where
-        F: FnOnce(&mut ClientInfo) -> Result<R, E>,
+        F: FnOnce(&mut ClientInfo) -> color_eyre::Result<R>,
     {
+        use color_eyre::eyre::eyre;
         let addr_map = self.clients_by_addr.read().await;
         let session_id = addr_map
             .get(addr)
             .cloned()
-            .ok_or_else(|| panic!("Client not found"))?;
+            .ok_or_else(|| eyre!("Client not found in addr_map: {}", addr))?;
         drop(addr_map);
 
         let mut id_map = self.clients_by_id.write().await;
         let client = id_map
             .get_mut(&session_id)
-            .ok_or_else(|| panic!("Client not found"))?;
+            .ok_or_else(|| eyre!("Client not found in id_map: {}", addr))?;
 
         f(client)
     }

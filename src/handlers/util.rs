@@ -137,7 +137,7 @@ pub async fn send_packet(
     use std::time::Instant;
 
     let response_packet = state
-        .update_client::<_, Vec<u8>, color_eyre::Report>(addr, |client| {
+        .update_client(addr, |client| {
             // Record timestamp when sending SERVER_TO_CLIENT_ACK for ping measurement
             if packet_type == msg::SERVER_TO_CLIENT_ACK {
                 client.last_ping_time = Some(Instant::now());
@@ -643,7 +643,7 @@ where
     F: FnOnce(&mut ClientInfo) -> R,
 {
     state
-        .update_client::<_, R, color_eyre::Report>(src, |client_info| Ok(f(client_info)))
+        .update_client(src, |client_info| Ok(f(client_info)))
         .await
 }
 
