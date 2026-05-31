@@ -22,6 +22,12 @@ use crate::simplest_game_sync;
 use crate::*;
 
 // Refactored handle_create_game function
+#[tracing::instrument(skip(message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+))]
 pub async fn handle_create_game(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -29,6 +35,7 @@ pub async fn handle_create_game(
 ) -> color_eyre::Result<()> {
     // Check if user is already in a game
     if let Some(client_info) = state.get_client(src).await {
+        util::record_session_fields(&client_info);
         if let Some(existing_game_id) = client_info.game_id {
             // Verify the game actually exists and user is still in it
             if let Some(existing_game) = state.get_game(existing_game_id).await {
@@ -136,6 +143,12 @@ pub async fn handle_create_game(
     Ok(())
 }
 
+#[tracing::instrument(skip(message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+))]
 pub async fn handle_join_game(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -155,6 +168,7 @@ pub async fn handle_join_game(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
+    util::record_session_fields(&client);
     let conn_type = client.conn_type;
 
     // Prevent joining if user is already in any game (same or different)
@@ -259,6 +273,12 @@ pub async fn handle_join_game(
 '            NB : Empty String [00]
 '            4B : GameID
  */
+#[tracing::instrument(skip(_message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+))]
 pub async fn handle_quit_game(
     _message: Vec<u8>,
     src: &std::net::SocketAddr,
@@ -266,7 +286,10 @@ pub async fn handle_quit_game(
 ) -> color_eyre::Result<()> {
     // Get client info and validate
     let client_info = match state.get_client(src).await {
-        Some(client_info) => client_info,
+        Some(client_info) => {
+            util::record_session_fields(&client_info);
+            client_info
+        }
         None => {
             error!(
                 { fields::ADDR } = %src,
@@ -419,6 +442,12 @@ pub async fn handle_quit_game(
 - **Server**: Sends data accordingly using **Game Data Notify** `[0x12]` or **Game Cache Notify** `[0x13]`
 
  */
+#[tracing::instrument(skip(message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+))]
 pub async fn handle_start_game(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -432,6 +461,7 @@ pub async fn handle_start_game(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
+    util::record_session_fields(&client);
     let requester_username = client.username.clone();
     let requester_user_id = client.user_id;
     let game_id = client
@@ -600,6 +630,7 @@ pub async fn execute_drop_game(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
+    util::record_session_fields(&client);
     let username = client.username.clone();
 
     // Validate game is playing and get dropper info
@@ -723,6 +754,12 @@ pub async fn execute_drop_game(
     Ok(true)
 }
 
+#[tracing::instrument(skip(_message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+))]
 pub async fn handle_drop_game(
     _message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -734,6 +771,7 @@ pub async fn handle_drop_game(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
+    util::record_session_fields(&client);
     let game_id = client
         .game_id
         .ok_or_else(|| eyre!("Client not in a game"))?;
@@ -748,6 +786,12 @@ pub async fn handle_drop_game(
   - Empty String
   - `2B`: UserID
 */
+#[tracing::instrument(skip(message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+))]
 pub async fn handle_kick_user(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -762,6 +806,7 @@ pub async fn handle_kick_user(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Requester not found"))?;
+    util::record_session_fields(&requester_info);
     let requester_username = requester_info.username.clone();
     let requester_user_id = requester_info.user_id;
     let requester_game_id = requester_info

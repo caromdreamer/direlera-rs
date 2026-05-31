@@ -11,6 +11,11 @@ use super::util;
 use crate::kaillera::message_types as msg;
 use crate::*;
 
+#[tracing::instrument(skip(message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+))]
 pub async fn handle_user_login(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -24,6 +29,8 @@ pub async fn handle_user_login(
     let emulator_name = util::read_string_bytes(&mut buf);
     // 1B: Connection Type
     let conn_type = if !buf.is_empty() { buf.get_u8() } else { 0 };
+
+    tracing::Span::current().record("username", util::bytes_for_log(&username).as_str());
 
     // Validate username length (31 bytes max - not characters, to preserve encoding)
     if username.len() > 31 {
@@ -119,6 +126,11 @@ pub async fn handle_user_login(
 '            2B : UserID
 '            NB : Message
  */
+#[tracing::instrument(skip(message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+))]
 pub async fn handle_user_quit(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -133,6 +145,10 @@ pub async fn handle_user_quit(
     let _code = if buf.len() >= 2 { buf.get_u16_le() } else { 0 };
     // NB: Message (read as bytes to preserve encoding)
     let user_message = util::read_string_bytes(&mut buf);
+
+    if let Some(client) = state.get_client(src).await {
+        util::record_session_fields(&client);
+    }
 
     // Handle quit game first
     super::game::handle_quit_game(vec![0x00, 0xFF, 0xFF], src, state.clone()).await?;

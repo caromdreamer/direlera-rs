@@ -13,6 +13,12 @@ use crate::*;
 - **2B**: Length of Game Data
 - **NB**: Game Data
  */
+#[tracing::instrument(level = "debug", skip(message, state), fields(
+    addr = %src,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+    player_id = tracing::field::Empty,
+))]
 pub async fn handle_game_data(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -29,6 +35,9 @@ pub async fn handle_game_data(
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
     let game_id = client.game_id.ok_or_else(|| eyre!("Game ID not found"))?;
+    tracing::Span::current()
+        .record("session_id", client.session_id.to_string().as_str())
+        .record("game_id", game_id);
 
     // Find player_id from address
     let game_info = state
@@ -40,6 +49,7 @@ pub async fn handle_game_data(
         .iter()
         .position(|p| p.addr == *src)
         .ok_or_else(|| eyre!("Player not in game"))?;
+    tracing::Span::current().record("player_id", player_id);
 
     debug!(
         { fields::PLAYER_ID } = player_id,
@@ -104,6 +114,12 @@ pub async fn handle_game_data(
     Ok(())
 }
 
+#[tracing::instrument(level = "debug", skip(message, state), fields(
+    addr = %src,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+    player_id = tracing::field::Empty,
+))]
 pub async fn handle_game_cache(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -119,6 +135,9 @@ pub async fn handle_game_cache(
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
     let game_id = client.game_id.ok_or_else(|| eyre!("Game ID not found"))?;
+    tracing::Span::current()
+        .record("session_id", client.session_id.to_string().as_str())
+        .record("game_id", game_id);
 
     // Find player_id from address
     let game_info = state
@@ -130,6 +149,7 @@ pub async fn handle_game_cache(
         .iter()
         .position(|p| p.addr == *src)
         .ok_or_else(|| eyre!("Player not in game"))?;
+    tracing::Span::current().record("player_id", player_id);
 
     // Process with SimpleGameSync. Return GameSyncError directly so we can inspect
     // the variant before converting to eyre (cache-miss needs a client notification).
@@ -208,6 +228,12 @@ pub async fn handle_game_cache(
     Ok(())
 }
 
+#[tracing::instrument(skip(message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+))]
 pub async fn handle_ready_to_play_signal(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -217,6 +243,10 @@ pub async fn handle_ready_to_play_signal(
     debug!("Ready to play signal received");
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = buf.get_u8(); // Empty String
+
+    if let Some(client) = state.get_client(src).await {
+        util::record_session_fields(&client);
+    }
 
     state
         .update_client::<_, (), color_eyre::Report>(src, |client_info| {

@@ -7,6 +7,17 @@ use crate::{packet_util, state, Message};
 
 use state::{AppState, ClientInfo, GameInfo};
 
+/// Record session context (username, session_id, game_id) onto the current span.
+/// Call this at the top of any handler after fetching ClientInfo.
+pub fn record_session_fields(client: &ClientInfo) {
+    let span = tracing::Span::current();
+    span.record("username", client.username_str().as_str());
+    span.record("session_id", client.session_id.to_string().as_str());
+    if let Some(game_id) = client.game_id {
+        span.record("game_id", game_id);
+    }
+}
+
 pub fn build_join_game_response(user: &ClientInfo) -> Vec<u8> {
     let mut data = BytesMut::new();
     packet_util::put_empty_string(&mut data);
