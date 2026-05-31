@@ -114,7 +114,7 @@ pub async fn handle_game_data(
     }
 
     metrics::histogram!(
-        "packet_processing_seconds",
+        "game_sync_processing_seconds",
         "type" => "game_data",
         "player_count" => game_info.players.len().to_string(),
     )
@@ -236,7 +236,7 @@ pub async fn handle_game_cache(
     }
 
     metrics::histogram!(
-        "packet_processing_seconds",
+        "game_sync_processing_seconds",
         "type" => "game_data",
         "player_count" => game_info.players.len().to_string(),
     )
