@@ -131,6 +131,11 @@ async fn main() -> color_eyre::Result<()> {
 
     init_logger(log_format, log_level);
 
+    metrics_exporter_prometheus::PrometheusBuilder::new()
+        .with_http_listener(([0, 0, 0, 0], 9091))
+        .install()
+        .expect("Failed to start Prometheus metrics exporter");
+
     let git_commit = std::env::var("GIT_COMMIT").unwrap_or_else(|_| "unknown".to_string());
     info!(git_commit = git_commit.as_str(), "Server starting");
 

@@ -21,6 +21,7 @@ pub async fn handle_message(
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    metrics::counter!("packets_received_total", "type" => crate::kaillera::message_types::message_type_name(message.message_type)).increment(1);
     match message.message_type {
         msg::USER_QUIT => user::handle_user_quit(message, src, state).await?,
         msg::USER_LOGIN => user::handle_user_login(message, src, state).await?,

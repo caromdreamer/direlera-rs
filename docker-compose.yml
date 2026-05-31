@@ -7,6 +7,7 @@ services:
     ports:
       - "8080:8080/udp"
       - "27888:27888/udp"
+      - "127.0.0.1:9091:9091"
     volumes:
       - ./config.toml:/app/config.toml:ro
 
