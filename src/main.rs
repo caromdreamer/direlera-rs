@@ -305,31 +305,40 @@ async fn process_packet_in_session(
 
     match parse_packet(&data) {
         Ok(messages) => {
-            for message in messages.iter() {
-                // Message number 0 signals the start of a new sequence
-                if message.message_number == 0 && messages.len() == 1 {
-                    *packet_counter = 0;
-                }
-            }
-
             for message in messages {
-                let message_number_to_process = *packet_counter;
+                let msg_num = message.message_number;
 
-                if message.message_number == message_number_to_process {
-                    *packet_counter = message_number_to_process + 1;
+                // Kaillera bundles include redundant copies of recent messages for
+                // UDP reliability. Use a sliding window: accept messages that are
+                // ahead of or equal to the counter (including wrap), skip ones that
+                // are behind (already processed duplicates).
+                // Window size 0x8000 handles the 0xFFFF→0 wrap correctly.
+                let ahead = msg_num.wrapping_sub(*packet_counter);
+                if ahead >= 0x8000 {
+                    // Behind counter — duplicate, skip silently
+                    continue;
+                }
 
-                    let msg_number = message.message_number;
-                    let msg_type = message.message_type;
+                if ahead > 0 {
+                    warn!(
+                        expected = *packet_counter,
+                        got = msg_num,
+                        skipped = ahead,
+                        "Packet gap detected (dropped UDP packets)"
+                    );
+                }
 
-                    if let Err(e) = handle_message(message, &addr, global_state.clone()).await {
-                        error!(
-                            { fields::MESSAGE_NUMBER } = msg_number,
-                            { fields::MESSAGE_TYPE } = format!("0x{:02X}", msg_type),
-                            error = ?e,
-                            error_chain = %e,
-                            "Failed to handle message"
-                        );
-                    }
+                *packet_counter = msg_num.wrapping_add(1);
+
+                let msg_type = message.message_type;
+                if let Err(e) = handle_message(message, &addr, global_state.clone()).await {
+                    error!(
+                        { fields::MESSAGE_NUMBER } = msg_num,
+                        { fields::MESSAGE_TYPE } = format!("0x{:02X}", msg_type),
+                        error = ?e,
+                        error_chain = %e,
+                        "Failed to handle message"
+                    );
                 }
             }
         }
