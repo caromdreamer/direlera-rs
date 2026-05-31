@@ -1,6 +1,7 @@
 services:
   direlera:
     image: ghcr.io/caromdreamer/direlera-rs:latest
+    container_name: direlera
     restart: always
     pull_policy: always
     ports:
