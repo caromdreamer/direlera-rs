@@ -32,6 +32,8 @@ pub struct Config {
     pub tracing: TracingConfig,
     #[serde(default = "default_welcome_message")]
     pub welcome_message: String,
+    /// Prometheus metrics HTTP listener port. Set to null/omit to disable.
+    pub metrics_port: Option<u16>,
 }
 
 impl Default for Config {
@@ -41,6 +43,7 @@ impl Default for Config {
             control_port: default_sub_port(),
             tracing: TracingConfig::default(),
             welcome_message: default_welcome_message(),
+            metrics_port: Some(9091),
         }
     }
 }
@@ -148,12 +151,17 @@ async fn main() -> color_eyre::Result<()> {
         0.1,      // 100ms
         0.5,      // 500ms
     ];
-    metrics_exporter_prometheus::PrometheusBuilder::new()
-        .with_http_listener(([0, 0, 0, 0], 9091))
-        .set_buckets(buckets)
-        .expect("Failed to set histogram buckets")
-        .install()
-        .expect("Failed to start Prometheus metrics exporter");
+    if let Some(port) = config.metrics_port {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(([0, 0, 0, 0], port))
+            .set_buckets(buckets)
+            .expect("Failed to set histogram buckets")
+            .install()
+            .expect("Failed to start Prometheus metrics exporter");
+        info!(port, "Prometheus metrics exporter started");
+    } else {
+        info!("Prometheus metrics exporter disabled");
+    }
 
     metrics::gauge!("active_sessions_total").set(0.0);
     metrics::gauge!("active_games_total").set(0.0);
