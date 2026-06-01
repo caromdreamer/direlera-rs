@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use tracing::warn;
+use tracing::{error, warn};
 
 type InputData = Vec<u8>;
 type OneInput = Vec<u8>;
@@ -71,6 +71,19 @@ impl InputCache {
     /// Add data to cache (evicts oldest slot when full).
     pub fn push(&mut self, data: Vec<u8>) {
         if self.slots.len() >= 256 {
+            // KNOWN BUG: after this eviction the server's VecDeque-relative positions
+            // (0 = oldest) diverge from the client's circular-buffer positions
+            // (abs_index % 256). All subsequent cache hits will reference wrong frames,
+            // causing game desyncs. This counter lets us observe when it happens.
+            metrics::counter!("game_cache_overflow_total").increment(1);
+            if self.abs_tail == 256 {
+                // first eviction ever for this cache instance
+                error!(
+                    abs_tail = self.abs_tail,
+                    "Game cache hit 256 entries and is now evicting — \
+                     cache positions will desync from client (known bug)"
+                );
+            }
             let evicted = self.slots.pop_front().unwrap();
             if let Some(indices) = self.index_map.get_mut(&evicted) {
                 indices.pop_front();
