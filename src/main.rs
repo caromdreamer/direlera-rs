@@ -32,8 +32,10 @@ pub struct Config {
     pub tracing: TracingConfig,
     #[serde(default = "default_welcome_message")]
     pub welcome_message: String,
-    /// Prometheus metrics HTTP listener port. Set to null/omit to disable.
-    pub metrics_port: Option<u16>,
+    #[serde(default)]
+    pub metrics_enabled: bool,
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
 }
 
 impl Default for Config {
@@ -43,7 +45,8 @@ impl Default for Config {
             control_port: default_sub_port(),
             tracing: TracingConfig::default(),
             welcome_message: default_welcome_message(),
-            metrics_port: Some(9091),
+            metrics_enabled: false,
+            metrics_port: default_metrics_port(),
         }
     }
 }
@@ -63,6 +66,10 @@ impl Default for TracingConfig {
             level: default_level(),
         }
     }
+}
+
+fn default_metrics_port() -> u16 {
+    9091
 }
 
 fn default_main_port() -> u16 {
@@ -151,14 +158,14 @@ async fn main() -> color_eyre::Result<()> {
         0.1,      // 100ms
         0.5,      // 500ms
     ];
-    if let Some(port) = config.metrics_port {
+    if config.metrics_enabled {
         metrics_exporter_prometheus::PrometheusBuilder::new()
-            .with_http_listener(([0, 0, 0, 0], port))
+            .with_http_listener(([0, 0, 0, 0], config.metrics_port))
             .set_buckets(buckets)
             .expect("Failed to set histogram buckets")
             .install()
             .expect("Failed to start Prometheus metrics exporter");
-        info!(port, "Prometheus metrics exporter started");
+        info!(port = config.metrics_port, "Prometheus metrics exporter started");
     } else {
         info!("Prometheus metrics exporter disabled");
     }
