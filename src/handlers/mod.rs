@@ -28,7 +28,7 @@ pub async fn handle_message(
         msg::CLIENT_TO_SERVER_ACK => handle_client_to_server_ack(src, state).await?,
         msg::GLOBAL_CHAT => chat::handle_global_chat(message, src, state).await?,
         msg::GAME_CHAT => chat::handle_game_chat(message, src, state).await?,
-        msg::CLIENT_KEEP_ALIVE => handle_client_keep_alive(message, src).await?,
+        msg::CLIENT_KEEP_ALIVE => handle_client_keep_alive(message, src, state).await?,
         msg::CREATE_GAME => game::handle_create_game(message, src, state).await?,
         msg::QUIT_GAME => game::handle_quit_game(message.data, src, state).await?,
         msg::JOIN_GAME => game::handle_join_game(message, src, state).await?,
@@ -113,8 +113,13 @@ pub async fn handle_client_to_server_ack(
 
 pub async fn handle_client_keep_alive(
     _message: kaillera::protocol::ParsedMessage,
-    _src: &std::net::SocketAddr,
+    src: &std::net::SocketAddr,
+    state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
-    // No additional handling needed
+    // Send SERVER_STATUS to keep the NAT mapping alive in both directions.
+    // Without this, the server→client NAT entry expires (~30-60s) while the
+    // client keeps sending keep-alives, making the server's responses invisible.
+    let data = util::make_server_status(src, &state).await?;
+    util::send_packet(&state, src, msg::SERVER_STATUS, data).await?;
     Ok(())
 }
