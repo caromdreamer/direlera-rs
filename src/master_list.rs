@@ -105,6 +105,31 @@ async fn collect(state: &AppState) -> (usize, usize, Vec<WaitingGame>) {
     (users, total_games, waiting)
 }
 
+struct KailleraTouch<'a> {
+    client: &'a Client,
+    url: &'a str,
+    ml: &'a MasterListConfig,
+    server_address: &'a str,
+    port: &'a str,
+    users: &'a str,
+    games: &'a str,
+    max_users: &'a str,
+    waiting: &'a [WaitingGame],
+}
+
+struct EmulinkerTouch<'a> {
+    client: &'a Client,
+    url: &'a str,
+    ml: &'a MasterListConfig,
+    server_address: &'a str,
+    port: &'a str,
+    users: &'a str,
+    games: &'a str,
+    max_users: &'a str,
+    max_games: &'a str,
+    waiting: &'a [WaitingGame],
+}
+
 async fn report(client: &Client, state: &AppState, server_address: &str) {
     let config = &state.config;
     let ml = &config.master_list;
@@ -125,51 +150,42 @@ async fn report(client: &Client, state: &AppState, server_address: &str) {
 
         match protocol {
             MasterProtocol::Kaillera => {
-                touch_kaillera(
+                touch_kaillera(KailleraTouch {
                     client,
-                    &url,
+                    url: &url,
                     ml,
                     server_address,
-                    &port,
-                    &users_s,
-                    &games_s,
-                    &max_users_s,
-                    &waiting,
-                )
+                    port: &port,
+                    users: &users_s,
+                    games: &games_s,
+                    max_users: &max_users_s,
+                    waiting: &waiting,
+                })
                 .await;
             }
             MasterProtocol::Emulinker => {
-                touch_emulinker(
+                touch_emulinker(EmulinkerTouch {
                     client,
-                    &url,
+                    url: &url,
                     ml,
                     server_address,
-                    &port,
-                    &users_s,
-                    &games_s,
-                    &max_users_s,
-                    &max_games_s,
-                    &waiting,
-                )
+                    port: &port,
+                    users: &users_s,
+                    games: &games_s,
+                    max_users: &max_users_s,
+                    max_games: &max_games_s,
+                    waiting: &waiting,
+                })
                 .await;
             }
         }
     }
 }
 
-async fn touch_kaillera(
-    client: &Client,
-    url: &str,
-    ml: &MasterListConfig,
-    server_address: &str,
-    port: &str,
-    users: &str,
-    games: &str,
-    max_users: &str,
-    waiting: &[WaitingGame],
-) {
+async fn touch_kaillera(t: KailleraTouch<'_>) {
     // format: {id}|{romName}|{ownerName}|{emulator}|{playerCount}|
-    let wgames: String = waiting
+    let wgames: String = t
+        .waiting
         .iter()
         .map(|g| {
             format!(
@@ -179,18 +195,19 @@ async fn touch_kaillera(
         })
         .collect();
 
-    let result = client
-        .get(url)
+    let result = t
+        .client
+        .get(t.url)
         .query(&[
-            ("servername", ml.server_name.as_str()),
-            ("port", port),
-            ("nbusers", users),
-            ("maxconn", max_users),
+            ("servername", t.ml.server_name.as_str()),
+            ("port", t.port),
+            ("nbusers", t.users),
+            ("maxconn", t.max_users),
             ("version", VERSION),
-            ("nbgames", games),
-            ("location", ml.server_location.as_str()),
-            ("ip", server_address),
-            ("url", ml.server_website.as_str()),
+            ("nbgames", t.games),
+            ("location", t.ml.server_location.as_str()),
+            ("ip", t.server_address),
+            ("url", t.ml.server_website.as_str()),
         ])
         .header("Kaillera-games", "")
         .header("Kaillera-wgames", wgames)
@@ -199,28 +216,18 @@ async fn touch_kaillera(
 
     match result {
         Ok(resp) => debug!(
-            url,
+            url = t.url,
             status = resp.status().as_u16(),
             "Kaillera master touched"
         ),
-        Err(e) => warn!(url, error = %e, "Failed to touch Kaillera master"),
+        Err(e) => warn!(url = t.url, error = %e, "Failed to touch Kaillera master"),
     }
 }
 
-async fn touch_emulinker(
-    client: &Client,
-    url: &str,
-    ml: &MasterListConfig,
-    server_address: &str,
-    port: &str,
-    users: &str,
-    games: &str,
-    max_users: &str,
-    max_games: &str,
-    waiting: &[WaitingGame],
-) {
+async fn touch_emulinker(t: EmulinkerTouch<'_>) {
     // format: {romName}|{ownerName}|{emulator}|{playerCount}/{maxPlayers}|
-    let wgames: String = waiting
+    let wgames: String = t
+        .waiting
         .iter()
         .map(|g| {
             format!(
@@ -230,18 +237,19 @@ async fn touch_emulinker(
         })
         .collect();
 
-    let result = client
-        .get(url)
+    let result = t
+        .client
+        .get(t.url)
         .query(&[
-            ("serverName", ml.server_name.as_str()),
-            ("ipAddress", server_address),
-            ("location", ml.server_location.as_str()),
-            ("website", ml.server_website.as_str()),
-            ("port", port),
-            ("numUsers", users),
-            ("maxUsers", max_users),
-            ("numGames", games),
-            ("maxGames", max_games),
+            ("serverName", t.ml.server_name.as_str()),
+            ("ipAddress", t.server_address),
+            ("location", t.ml.server_location.as_str()),
+            ("website", t.ml.server_website.as_str()),
+            ("port", t.port),
+            ("numUsers", t.users),
+            ("maxUsers", t.max_users),
+            ("numGames", t.games),
+            ("maxGames", t.max_games),
             ("version", VERSION),
         ])
         .header("Waiting-games", wgames)
@@ -250,10 +258,10 @@ async fn touch_emulinker(
 
     match result {
         Ok(resp) => debug!(
-            url,
+            url = t.url,
             status = resp.status().as_u16(),
             "EmuLinker master touched"
         ),
-        Err(e) => warn!(url, error = %e, "Failed to touch EmuLinker master"),
+        Err(e) => warn!(url = t.url, error = %e, "Failed to touch EmuLinker master"),
     }
 }
