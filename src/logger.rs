@@ -1,6 +1,7 @@
 // Logger configuration and setup
 use std::str::FromStr;
-use tracing_subscriber::{fmt::format::FmtSpan, EnvFilter};
+use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
+use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
 
 /// Initialize logger with different formats
 pub fn init_logger(format: LogFormat, level: LogLevel) {
@@ -12,7 +13,6 @@ pub fn init_logger(format: LogFormat, level: LogLevel) {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_target(false)
-                .with_span_events(FmtSpan::CLOSE)
                 .init();
         }
         LogFormat::Pretty => {
@@ -20,18 +20,20 @@ pub fn init_logger(format: LogFormat, level: LogLevel) {
                 .with_env_filter(filter)
                 .with_target(false)
                 .pretty()
-                .with_span_events(FmtSpan::CLOSE)
                 .init();
         }
         LogFormat::Json => {
-            tracing_subscriber::fmt()
-                .with_env_filter(filter)
-                .with_target(false)
-                .json()
-                .flatten_event(true)
-                .with_current_span(false)
-                .with_span_events(FmtSpan::CLOSE)
-                .init();
+            // BunyanFormattingLayer propagates parent span fields into each log event,
+            // producing flat JSON where session_id / game_id appear at the top level.
+            let subscriber = Registry::default()
+                .with(filter)
+                .with(JsonStorageLayer)
+                .with(BunyanFormattingLayer::new(
+                    "direlera-rs".into(),
+                    std::io::stdout,
+                ));
+            tracing::subscriber::set_global_default(subscriber)
+                .expect("Failed to set tracing subscriber");
         }
     }
 }

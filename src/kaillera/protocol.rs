@@ -26,6 +26,10 @@ pub fn make_packet(message_type: u8, seq: u16, data: Vec<u8>) -> Vec<u8> {
 pub struct UDPPacketGenerator {
     recent_packets: VecDeque<Vec<u8>>,
     send_count: u16,
+    /// Exact bytes of the last packet sent to this client (redundancy bundle
+    /// included). Resent verbatim to a stalled client; message numbers are
+    /// unchanged so the client dedups already-processed messages.
+    last_sent: Option<Vec<u8>>,
 }
 
 impl Default for UDPPacketGenerator {
@@ -41,6 +45,7 @@ impl UDPPacketGenerator {
         Self {
             recent_packets: VecDeque::with_capacity(Self::MAX_RECENT_PACKETS),
             send_count: 0,
+            last_sent: None,
         }
     }
 
@@ -67,7 +72,15 @@ impl UDPPacketGenerator {
         }
 
         self.send_count = self.send_count.wrapping_add(1);
+        self.last_sent = Some(result.clone());
         result
+    }
+
+    /// Returns the exact bytes of the last packet sent to this client, for
+    /// resending when the client stalls (stops sending game input). Returns
+    /// `None` if nothing has been sent yet.
+    pub fn last_sent(&self) -> Option<Vec<u8>> {
+        self.last_sent.clone()
     }
 }
 

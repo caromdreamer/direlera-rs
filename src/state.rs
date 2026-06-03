@@ -2,11 +2,11 @@ use crate::simplest_game_sync;
 use std::{
     collections::HashMap,
     net::SocketAddr,
-    sync::atomic::{AtomicU16, AtomicU32, Ordering},
+    sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering},
     sync::Arc,
-    time::Instant,
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::{mpsc, Mutex as GameMutex, RwLock};
 use uuid::Uuid;
 
 type PlayerStatus = u8;
@@ -20,8 +20,7 @@ pub struct AppState {
     // RwLock: multiple readers, exclusive writer
     pub clients_by_addr: Arc<RwLock<HashMap<SocketAddr, Uuid>>>,
     pub clients_by_id: Arc<RwLock<HashMap<Uuid, ClientInfo>>>,
-    pub games: Arc<RwLock<HashMap<u32, GameInfo>>>,
-    pub packet_peeker: Arc<RwLock<HashMap<SocketAddr, u16>>>,
+    pub games: Arc<RwLock<HashMap<u32, Arc<GameMutex<GameInfo>>>>>,
 
     // Atomic: lock-free counter increment
     pub next_game_id: Arc<AtomicU32>,
@@ -31,6 +30,8 @@ pub struct AppState {
 
     // Server configuration
     pub config: Arc<crate::Config>,
+
+    pub start_time: std::time::Instant,
 }
 
 impl AppState {
@@ -39,11 +40,11 @@ impl AppState {
             clients_by_addr: Arc::new(RwLock::new(HashMap::new())),
             clients_by_id: Arc::new(RwLock::new(HashMap::new())),
             games: Arc::new(RwLock::new(HashMap::new())),
-            packet_peeker: Arc::new(RwLock::new(HashMap::new())),
             next_game_id: Arc::new(AtomicU32::new(1)),
             next_user_id: Arc::new(AtomicU16::new(1)),
             tx,
             config: Arc::new(config),
+            start_time: std::time::Instant::now(),
         }
     }
 
@@ -73,6 +74,8 @@ impl AppState {
 
         let mut addr_map = self.clients_by_addr.write().await;
         addr_map.insert(addr, session_id);
+
+        metrics::gauge!("active_sessions_total").increment(1.0);
     }
 
     pub async fn remove_client(&self, addr: &SocketAddr) -> Option<ClientInfo> {
@@ -80,7 +83,79 @@ impl AppState {
         let session_id = addr_map.remove(addr)?;
 
         let mut id_map = self.clients_by_id.write().await;
-        id_map.remove(&session_id)
+        let client = id_map.remove(&session_id);
+        if client.is_some() {
+            metrics::gauge!("active_sessions_total").decrement(1.0);
+        }
+        client
+    }
+
+    /// Find and remove any existing client with the same username.
+    /// Used to evict stale sessions when a user reconnects from a new address.
+    pub async fn remove_client_by_username(
+        &self,
+        username: &[u8],
+    ) -> Option<(SocketAddr, ClientInfo)> {
+        let session_id = {
+            let id_map = self.clients_by_id.read().await;
+            id_map
+                .iter()
+                .find(|(_, c)| c.username == username)
+                .map(|(id, _)| *id)?
+        };
+
+        let old_addr = {
+            let mut addr_map = self.clients_by_addr.write().await;
+            let addr = addr_map
+                .iter()
+                .find(|(_, v)| **v == session_id)
+                .map(|(k, _)| *k)?;
+            addr_map.remove(&addr);
+            addr
+        };
+
+        let mut id_map = self.clients_by_id.write().await;
+        let client = id_map.remove(&session_id)?;
+
+        metrics::gauge!("active_sessions_total").decrement(1.0);
+        Some((old_addr, client))
+    }
+
+    /// Read-only lookup of a client by username (does not remove).
+    pub async fn find_client_by_username(
+        &self,
+        username: &[u8],
+    ) -> Option<(SocketAddr, ClientInfo)> {
+        let (session_id, client) = {
+            let id_map = self.clients_by_id.read().await;
+            id_map
+                .iter()
+                .find(|(_, c)| c.username == username)
+                .map(|(id, c)| (*id, c.clone()))?
+        };
+
+        let addr_map = self.clients_by_addr.read().await;
+        let addr = addr_map
+            .iter()
+            .find(|(_, &v)| v == session_id)
+            .map(|(k, _)| *k)?;
+
+        Some((addr, client))
+    }
+
+    /// Update the last-activity timestamp for a client (lock-free after addr lookup).
+    pub async fn update_client_activity(&self, addr: &SocketAddr) {
+        let secs = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let addr_map = self.clients_by_addr.read().await;
+        if let Some(&session_id) = addr_map.get(addr) {
+            let id_map = self.clients_by_id.read().await;
+            if let Some(client) = id_map.get(&session_id) {
+                client.last_activity_secs.store(secs, Ordering::Relaxed);
+            }
+        }
     }
 
     // Get all client addresses
@@ -92,47 +167,68 @@ impl AppState {
     // Game operations
     pub async fn add_game(&self, game_id: u32, game: GameInfo) {
         let mut games = self.games.write().await;
-        games.insert(game_id, game);
+        games.insert(game_id, Arc::new(GameMutex::new(game)));
+        metrics::gauge!("active_games_total").increment(1.0);
     }
 
     pub async fn get_game(&self, game_id: u32) -> Option<GameInfo> {
-        let games = self.games.read().await;
-        games.get(&game_id).cloned()
+        let arc = {
+            let games = self.games.read().await;
+            games.get(&game_id)?.clone()
+        };
+        let guard = arc.lock().await;
+        Some(guard.clone())
     }
 
     pub async fn remove_game(&self, game_id: u32) -> Option<GameInfo> {
-        let mut games = self.games.write().await;
-        games.remove(&game_id)
+        let arc = {
+            let mut games = self.games.write().await;
+            games.remove(&game_id)?
+        };
+        metrics::gauge!("active_games_total").decrement(1.0);
+        let guard = arc.lock().await;
+        Some(guard.clone())
     }
 
+    /// Update a specific game under its own per-game lock (not the global HashMap lock).
+    /// Multiple games can be updated concurrently.
     pub async fn update_game<F, R, E>(&self, game_id: u32, f: F) -> Result<R, E>
     where
         F: FnOnce(&mut GameInfo) -> Result<R, E>,
     {
-        let mut games = self.games.write().await;
-        let game = games.get_mut(&game_id).ok_or_else(|| {
-            // This will be converted to the error type E by the caller
-            panic!("Game not found")
-        })?;
-
-        f(game)
+        let arc = {
+            let games = self.games.read().await;
+            games
+                .get(&game_id)
+                .unwrap_or_else(|| panic!("Game not found: {}", game_id))
+                .clone()
+        };
+        let mut game = arc.lock().await;
+        f(&mut game)
     }
 
-    pub async fn update_client<F, R, E>(&self, addr: &SocketAddr, f: F) -> Result<R, E>
+    /// Get the per-game Arc<Mutex> for direct access patterns.
+    pub async fn get_game_arc(&self, game_id: u32) -> Option<Arc<GameMutex<GameInfo>>> {
+        let games = self.games.read().await;
+        games.get(&game_id).cloned()
+    }
+
+    pub async fn update_client<F, R>(&self, addr: &SocketAddr, f: F) -> color_eyre::Result<R>
     where
-        F: FnOnce(&mut ClientInfo) -> Result<R, E>,
+        F: FnOnce(&mut ClientInfo) -> color_eyre::Result<R>,
     {
+        use color_eyre::eyre::eyre;
         let addr_map = self.clients_by_addr.read().await;
         let session_id = addr_map
             .get(addr)
             .cloned()
-            .ok_or_else(|| panic!("Client not found"))?;
+            .ok_or_else(|| eyre!("Client not found in addr_map: {}", addr))?;
         drop(addr_map);
 
         let mut id_map = self.clients_by_id.write().await;
         let client = id_map
             .get_mut(&session_id)
-            .ok_or_else(|| panic!("Client not found"))?;
+            .ok_or_else(|| eyre!("Client not found in id_map: {}", addr))?;
 
         f(client)
     }
@@ -152,7 +248,8 @@ pub struct ClientInfo {
     pub last_ping_time: Option<Instant>, // Timestamp when SERVER_TO_CLIENT_ACK was sent (for RTT measurement)
     pub ack_count: u16,
     pub ping_samples: Vec<u32>, // Recent RTT measurements for averaging (max 5, excluding first measurement)
-    //////////////////
+    /// Unix timestamp (seconds) of the last received packet — updated lock-free
+    pub last_activity_secs: Arc<AtomicU64>,
     /// Packet generator for this client (handles sequence numbers and redundancy)
     pub packet_generator: crate::kaillera::protocol::UDPPacketGenerator,
 }
@@ -196,6 +293,10 @@ pub struct GamePlayerInfo {
     pub username: Vec<u8>, // Store as bytes to preserve original encoding
     pub user_id: u16,
     pub conn_type: u8,
+    /// Timestamp of last received game_data packet (for jitter calculation)
+    pub last_game_data_recv: Option<std::time::Instant>,
+    /// Most recent inter-arrival interval (for consecutive diff jitter)
+    pub last_interval_secs: Option<f64>,
 }
 
 impl GamePlayerInfo {

@@ -15,6 +15,7 @@ mod state;
 mod handlers;
 use handlers::*;
 
+mod master_list;
 mod session_manager;
 
 mod simplest_game_sync;
@@ -32,6 +33,12 @@ pub struct Config {
     pub tracing: TracingConfig,
     #[serde(default = "default_welcome_message")]
     pub welcome_message: String,
+    #[serde(default)]
+    pub metrics_enabled: bool,
+    #[serde(default = "default_metrics_port")]
+    pub metrics_port: u16,
+    #[serde(default)]
+    pub master_list: MasterListConfig,
 }
 
 impl Default for Config {
@@ -41,6 +48,9 @@ impl Default for Config {
             control_port: default_sub_port(),
             tracing: TracingConfig::default(),
             welcome_message: default_welcome_message(),
+            metrics_enabled: false,
+            metrics_port: default_metrics_port(),
+            master_list: MasterListConfig::default(),
         }
     }
 }
@@ -62,12 +72,124 @@ impl Default for TracingConfig {
     }
 }
 
+// ── Master server list ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MasterListConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub server_name: String,
+    /// Public IP or hostname that clients use to connect.
+    #[serde(default)]
+    pub server_address: String,
+    #[serde(default)]
+    pub server_location: String,
+    #[serde(default)]
+    pub server_website: String,
+    #[serde(default = "master_default_max_users")]
+    pub max_users: u32,
+    #[serde(default = "master_default_max_games")]
+    pub max_games: u32,
+    /// List of master servers to report to. Defaults to the two official servers
+    /// when omitted. Add any number of entries to report to additional endpoints.
+    #[serde(default = "default_master_servers")]
+    pub servers: Vec<MasterServerConfig>,
+}
+
+impl Default for MasterListConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_name: String::new(),
+            server_address: String::new(),
+            server_location: String::new(),
+            server_website: String::new(),
+            max_users: master_default_max_users(),
+            max_games: master_default_max_games(),
+            servers: default_master_servers(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MasterServerConfig {
+    #[serde(flatten)]
+    pub endpoint: MasterEndpoint,
+}
+
+/// Either a named preset (URL + protocol bundled) or a fully custom entry.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum MasterEndpoint {
+    Preset {
+        preset: MasterPreset,
+    },
+    Custom {
+        url: String,
+        protocol: MasterProtocol,
+    },
+}
+
+/// Built-in named servers — no URL to memorize.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum MasterPreset {
+    /// http://www.kaillera.com/touch_server.php
+    Kaillera,
+    /// http://kaillerareborn.2manygames.fr/touch_list.php
+    Emulinker,
+}
+
+impl MasterPreset {
+    pub fn url(&self) -> &'static str {
+        match self {
+            MasterPreset::Kaillera => "http://www.kaillera.com/touch_server.php",
+            MasterPreset::Emulinker => "http://kaillerareborn.2manygames.fr/touch_list.php",
+        }
+    }
+
+    pub fn protocol(&self) -> MasterProtocol {
+        match self {
+            MasterPreset::Kaillera => MasterProtocol::Kaillera,
+            MasterPreset::Emulinker => MasterProtocol::Emulinker,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MasterProtocol {
+    /// kaillera.com-style: query params servername/nbusers/ip/…
+    Kaillera,
+    /// EmuLinkerReborn-style: query params serverName/numUsers/ipAddress/…
+    Emulinker,
+}
+
+fn default_master_servers() -> Vec<MasterServerConfig> {
+    vec![]
+}
+
+fn master_default_max_users() -> u32 {
+    100
+}
+
+fn master_default_max_games() -> u32 {
+    50
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+
+fn default_metrics_port() -> u16 {
+    9091
+}
+
 fn default_main_port() -> u16 {
-    27888
+    8080
 }
 
 fn default_sub_port() -> u16 {
-    8080
+    27888
 }
 
 fn default_format() -> String {
@@ -131,6 +253,44 @@ async fn main() -> color_eyre::Result<()> {
 
     init_logger(log_format, log_level);
 
+    // Buckets in seconds. Without explicit buckets the exporter emits summary
+    // type instead of histogram, which breaks histogram_quantile() in PromQL.
+    let buckets = &[
+        0.000005, // 5µs
+        0.00001,  // 10µs
+        0.00002,  // 20µs
+        0.00005,  // 50µs
+        0.0001,   // 100µs
+        0.0002,   // 200µs
+        0.0005,   // 500µs
+        0.001,    // 1ms
+        0.005,    // 5ms
+        0.01,     // 10ms
+        0.05,     // 50ms
+        0.1,      // 100ms
+        0.5,      // 500ms
+    ];
+    if config.metrics_enabled {
+        metrics_exporter_prometheus::PrometheusBuilder::new()
+            .with_http_listener(([0, 0, 0, 0], config.metrics_port))
+            .set_buckets(buckets)
+            .expect("Failed to set histogram buckets")
+            .install()
+            .expect("Failed to start Prometheus metrics exporter");
+        info!(
+            port = config.metrics_port,
+            "Prometheus metrics exporter started"
+        );
+    } else {
+        info!("Prometheus metrics exporter disabled");
+    }
+
+    metrics::gauge!("active_sessions_total").set(0.0);
+    metrics::gauge!("active_games_total").set(0.0);
+
+    let git_commit = std::env::var("GIT_COMMIT").unwrap_or_else(|_| "unknown".to_string());
+    info!(git_commit = git_commit.as_str(), "Server starting");
+
     info!(
         { fields::CONFIG_SOURCE } = "config.toml",
         { fields::PORT } = config.main_port,
@@ -188,12 +348,17 @@ async fn main() -> color_eyre::Result<()> {
         .clone()
         .start_cleanup_task(global_state.clone());
 
+    // Start stall recovery task — resends the last packet to stalled players
+    session_manager::start_stall_resend_task(global_state.clone());
+
     // Start session manager (spawns handlers for each client)
     let manager_for_run = session_manager.clone();
     let state_for_sessions = global_state.clone();
     tokio::spawn(async move {
         manager_for_run.run(packet_rx, state_for_sessions).await;
     });
+
+    tokio::spawn(master_list::run(global_state.clone()));
 
     info!("Server initialization complete");
 
@@ -240,11 +405,11 @@ async fn main() -> color_eyre::Result<()> {
         };
         let data = buf[..len].to_vec();
 
-        debug!(
-            { fields::ADDR } = %src,
-            { fields::PACKET_SIZE } = len,
-            "Packet received - forwarding to session manager"
-        );
+        // PING probe — respond immediately without creating a session
+        if data == b"PING\x00" {
+            let _ = main_socket.send_to(b"PONG\x00", src).await;
+            continue;
+        }
 
         // Forward to session manager (will create session if needed)
         if let Err(e) = packet_sender.send((src, data)).await {
@@ -263,40 +428,33 @@ pub struct Message {
     pub addr: std::net::SocketAddr,
 }
 
-/// Process a single packet within a session
+/// Process a single packet within a session.
+/// `packet_counter` is per-session local state tracking the next expected message number.
 async fn process_packet_in_session(
     data: Vec<u8>,
     addr: std::net::SocketAddr,
     global_state: Arc<AppState>,
+    packet_counter: &mut u16,
 ) {
-    debug!("Processing packet");
-
-    // Parse and handle messages
     match parse_packet(&data) {
         Ok(messages) => {
             for message in messages.iter() {
-                // 0 is special case, it means the first message
+                // Message number 0 signals the start of a new sequence
                 if message.message_number == 0 && messages.len() == 1 {
-                    global_state.packet_peeker.write().await.insert(addr, 0);
+                    *packet_counter = 0;
                 }
             }
 
             for message in messages {
-                let mut packet_peeker_lock = global_state.packet_peeker.write().await;
-                let message_number_to_process = *packet_peeker_lock.get(&addr).unwrap_or(&0);
+                let message_number_to_process = *packet_counter;
 
                 if message.message_number == message_number_to_process {
-                    // Update message number before processing to release lock quickly
-                    packet_peeker_lock.insert(addr, message_number_to_process + 1);
-                    drop(packet_peeker_lock); // Explicitly release lock before long operation
+                    *packet_counter = message_number_to_process + 1;
 
-                    // Save message_number before moving message
                     let msg_number = message.message_number;
                     let msg_type = message.message_type;
 
-                    // Handle message and log errors without crashing
                     if let Err(e) = handle_message(message, &addr, global_state.clone()).await {
-                        // Use Debug format to include error chain and context
                         error!(
                             { fields::MESSAGE_NUMBER } = msg_number,
                             { fields::MESSAGE_TYPE } = format!("0x{:02X}", msg_type),
@@ -309,7 +467,6 @@ async fn process_packet_in_session(
             }
         }
         Err(e) => {
-            // Log first few bytes for debugging
             let preview = if !data.is_empty() {
                 format!("{:02x?}", &data[..data.len().min(20)])
             } else {

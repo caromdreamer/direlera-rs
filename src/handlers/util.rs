@@ -7,6 +7,23 @@ use crate::{packet_util, state, Message};
 
 use state::{AppState, ClientInfo, GameInfo};
 
+/// Record packet_processing_seconds histogram for a given message type.
+pub fn record_processing_time(msg_type: &'static str, elapsed: std::time::Duration) {
+    metrics::histogram!("packet_processing_seconds", "type" => msg_type)
+        .record(elapsed.as_secs_f64());
+}
+
+/// Record session context (username, session_id, game_id) onto the current span.
+/// Call this at the top of any handler after fetching ClientInfo.
+pub fn record_session_fields(client: &ClientInfo) {
+    let span = tracing::Span::current();
+    span.record("username", client.username_str().as_str());
+    span.record("session_id", client.session_id.to_string().as_str());
+    if let Some(game_id) = client.game_id {
+        span.record("game_id", game_id);
+    }
+}
+
 pub fn build_join_game_response(user: &ClientInfo) -> Vec<u8> {
     let mut data = BytesMut::new();
     packet_util::put_empty_string(&mut data);
@@ -120,7 +137,7 @@ pub async fn send_packet(
     use std::time::Instant;
 
     let response_packet = state
-        .update_client::<_, Vec<u8>, color_eyre::Report>(addr, |client| {
+        .update_client(addr, |client| {
             // Record timestamp when sending SERVER_TO_CLIENT_ACK for ping measurement
             if packet_type == msg::SERVER_TO_CLIENT_ACK {
                 client.last_ping_time = Some(Instant::now());
@@ -506,8 +523,24 @@ pub async fn make_server_information(
     let encoding = detect_encoding_from_message(&state.config.welcome_message);
     info!("Encoding: {}", encoding.name());
 
+    // Append uptime to welcome message
+    let uptime = state.start_time.elapsed();
+    let uptime_secs = uptime.as_secs();
+    let days = uptime_secs / 86400;
+    let hours = (uptime_secs % 86400) / 3600;
+    let mins = (uptime_secs % 3600) / 60;
+    let secs = uptime_secs % 60;
+    let uptime_str = if days > 0 {
+        format!("{}d {}h {}m {}s", days, hours, mins, secs)
+    } else if hours > 0 {
+        format!("{}h {}m {}s", hours, mins, secs)
+    } else {
+        format!("{}m {}s", mins, secs)
+    };
+    let full_message = format!("{}\nUptime: {}", state.config.welcome_message, uptime_str);
+
     // Convert welcome message from UTF-8 (config.toml) to detected encoding
-    let (welcome_bytes, _, had_errors) = encoding.encode(&state.config.welcome_message);
+    let (welcome_bytes, _, had_errors) = encoding.encode(&full_message);
     if had_errors {
         debug!(
             encoding = encoding.name(),
@@ -526,19 +559,24 @@ pub async fn make_server_status(
 ) -> color_eyre::Result<Vec<u8>> {
     let addr_map = state.clients_by_addr.read().await;
     let id_map = state.clients_by_id.read().await;
-    let games_lock = state.games.read().await;
+
+    // Collect game Arcs while holding only a brief read lock on the HashMap
+    let (num_games, game_arcs) = {
+        let games_lock = state.games.read().await;
+        (
+            games_lock.len() as u32,
+            games_lock.values().cloned().collect::<Vec<_>>(),
+        )
+    };
 
     // Prepare response data
     let mut data = BytesMut::new();
     packet_util::put_empty_string(&mut data);
 
     // Number of users (excluding self)
-    // Safe: addr_map.len() is always >= 1 when this function is called (at least the caller exists)
     let num_users = addr_map.len().saturating_sub(1);
     data.put_u32_le(num_users as u32);
 
-    // Number of games
-    let num_games = games_lock.len() as u32;
     data.put_u32_le(num_games);
 
     // User list
@@ -554,8 +592,9 @@ pub async fn make_server_status(
         }
     }
 
-    // Game list
-    for game_info in games_lock.values() {
+    // Game list — lock each game independently
+    for game_arc in &game_arcs {
+        let game_info = game_arc.lock().await;
         packet_util::put_bytes_with_null(&mut data, &game_info.game_name);
         data.put_u32_le(game_info.game_id);
         packet_util::put_bytes_with_null(&mut data, &game_info.emulator_name);
@@ -620,7 +659,7 @@ where
     F: FnOnce(&mut ClientInfo) -> R,
 {
     state
-        .update_client::<_, R, color_eyre::Report>(src, |client_info| Ok(f(client_info)))
+        .update_client(src, |client_info| Ok(f(client_info)))
         .await
 }
 

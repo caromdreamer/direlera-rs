@@ -1,0 +1,78 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main, dev]
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/caromdreamer/direlera-rs
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --verbose
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+
+  build-and-push:
+    runs-on: ubuntu-latest
+    needs: test
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:latest
+            ${{ env.IMAGE }}:${{ github.sha }}
+          build-args: COMMIT_SHA=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Deploy to EC2
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > key.pem
+          chmod 600 key.pem
+
+          # docker-compose.yml 복사
+          scp -i key.pem -o StrictHostKeyChecking=no \
+            docker-compose.yml \
+            ec2-user@${{ secrets.EC2_HOST }}:~/direlera/docker-compose.yml
+
+          # 이미지 pull 후 재시작
+          ssh -i key.pem -o StrictHostKeyChecking=no \
+            ec2-user@${{ secrets.EC2_HOST }} "
+              echo '${{ secrets.GITHUB_TOKEN }}' \
+                | docker login ghcr.io -u ${{ github.actor }} --password-stdin &&
+              cd ~/direlera &&
+              docker compose pull &&
+              docker compose up -d --remove-orphans
+            "
+
+          rm key.pem

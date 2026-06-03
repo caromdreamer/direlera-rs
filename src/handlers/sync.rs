@@ -1,6 +1,7 @@
 use bytes::{Buf, BytesMut};
 use color_eyre::eyre::eyre;
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::debug;
 
 use super::util;
@@ -13,12 +14,18 @@ use crate::*;
 - **2B**: Length of Game Data
 - **NB**: Game Data
  */
+#[tracing::instrument(level = "debug", skip(message, state), fields(
+    addr = %src,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+    player_id = tracing::field::Empty,
+))]
 pub async fn handle_game_data(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
-    debug!("Game data received");
+    let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = buf.get_u8(); // Empty String
     let data_length = buf.get_u16_le() as usize;
@@ -29,6 +36,9 @@ pub async fn handle_game_data(
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
     let game_id = client.game_id.ok_or_else(|| eyre!("Game ID not found"))?;
+    tracing::Span::current()
+        .record("session_id", client.session_id.to_string().as_str())
+        .record("game_id", game_id);
 
     // Find player_id from address
     let game_info = state
@@ -40,33 +50,53 @@ pub async fn handle_game_data(
         .iter()
         .position(|p| p.addr == *src)
         .ok_or_else(|| eyre!("Player not in game"))?;
+    tracing::Span::current().record("player_id", player_id);
 
-    debug!(
-        { fields::PLAYER_ID } = player_id,
-        { fields::DATA_LENGTH } = game_data.len(),
-        "Player sent game data"
-    );
+    // Process with SimpleGameSync (per-game lock — does not block other games)
+    let (outputs, cache_overflowed, cache_milestone) = state
+        .update_game(game_id, |game_info| {
+            // Jitter: consecutive inter-arrival time difference for this player
+            let now = Instant::now();
+            let player_count = game_info.players.len().to_string();
+            if let Some(player) = game_info.players.get_mut(player_id) {
+                if let Some(last_recv) = player.last_game_data_recv {
+                    let interval = now.duration_since(last_recv).as_secs_f64();
+                    if let Some(last_interval) = player.last_interval_secs {
+                        let jitter = (interval - last_interval).abs();
+                        metrics::histogram!(
+                            "game_data_jitter_seconds",
+                            "player_count" => player_count,
+                        )
+                        .record(jitter);
+                    }
+                    player.last_interval_secs = Some(interval);
+                }
+                player.last_game_data_recv = Some(now);
+            }
 
-    // Process with SimpleGameSync
-    let outputs = {
-        let mut games = state.games.write().await;
-        let game_info = games
-            .get_mut(&game_id)
-            .ok_or_else(|| eyre!("Game not found"))?;
+            let sync_manager = game_info
+                .sync_manager
+                .as_mut()
+                .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
+            sync_manager
+                .process_client_input(
+                    player_id,
+                    simplest_game_sync::ClientInput::GameData(game_data),
+                )
+                .map_err(|e| eyre!("Game sync error: {}", e))
+        })
+        .await?;
 
-        let sync_manager = game_info
-            .sync_manager
-            .as_mut()
-            .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
-
-        // Process input using CachedGameSync
-        sync_manager
-            .process_client_input(
-                player_id,
-                simplest_game_sync::ClientInput::GameData(game_data),
-            )
-            .map_err(|e| eyre!("Game sync error: {}", e))?
-    };
+    if let Some(n) = cache_milestone {
+        let msg_text = format!("[Debug] cache {}/256", n);
+        let data = crate::packet_util::build_game_chat_packet(b"Server", msg_text.as_bytes());
+        util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, data).await?;
+    }
+    if cache_overflowed {
+        let data =
+            crate::packet_util::build_game_chat_packet(b"Server", b"[Debug] cache evicted (256+)");
+        util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, data).await?;
+    }
 
     // Send outputs to respective players
     let game_info = state
@@ -97,24 +127,31 @@ pub async fn handle_game_data(
             ),
         };
 
-        debug!(
-            { fields::PLAYER_ID } = output.player_id,
-            message_type = msg::message_type_name(message_type),
-            { fields::DATA_LENGTH } = data_to_send.len(),
-            "Sending game data to player"
-        );
         util::send_packet(&state, &target_addr, message_type, data_to_send).await?;
     }
+
+    metrics::histogram!(
+        "game_sync_processing_seconds",
+        "type" => "game_data",
+        "player_count" => game_info.players.len().to_string(),
+    )
+    .record(start.elapsed().as_secs_f64());
 
     Ok(())
 }
 
+#[tracing::instrument(level = "debug", skip(message, state), fields(
+    addr = %src,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+    player_id = tracing::field::Empty,
+))]
 pub async fn handle_game_cache(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
-    debug!("Game cache received");
+    let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = buf.get_u8(); // Empty String
     let cache_position = buf.get_u8();
@@ -124,6 +161,9 @@ pub async fn handle_game_cache(
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
     let game_id = client.game_id.ok_or_else(|| eyre!("Game ID not found"))?;
+    tracing::Span::current()
+        .record("session_id", client.session_id.to_string().as_str())
+        .record("game_id", game_id);
 
     // Find player_id from address
     let game_info = state
@@ -135,27 +175,58 @@ pub async fn handle_game_cache(
         .iter()
         .position(|p| p.addr == *src)
         .ok_or_else(|| eyre!("Player not in game"))?;
+    tracing::Span::current().record("player_id", player_id);
 
-    // Process with SimpleGameSync
-    let outputs = {
-        let mut games = state.games.write().await;
-        let game_info = games
-            .get_mut(&game_id)
-            .ok_or_else(|| eyre!("Game not found"))?;
-
-        let sync_manager = game_info
-            .sync_manager
-            .as_mut()
-            .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
-
-        // Process input using CachedGameSync
-        sync_manager
-            .process_client_input(
+    // Process with SimpleGameSync. Return GameSyncError directly so we can inspect
+    // the variant before converting to eyre (cache-miss needs a client notification).
+    let sync_result: Result<_, simplest_game_sync::GameSyncError> = state
+        .update_game(game_id, |game_info| {
+            // Track last game input time for stall detection (same as game_data).
+            if let Some(player) = game_info.players.get_mut(player_id) {
+                player.last_game_data_recv = Some(Instant::now());
+            }
+            let sync_manager = game_info.sync_manager.as_mut().ok_or(
+                simplest_game_sync::GameSyncError::BufferInconsistency {
+                    message: "sync_manager not initialized".into(),
+                },
+            )?;
+            sync_manager.process_client_input(
                 player_id,
                 simplest_game_sync::ClientInput::GameCache(cache_position),
             )
-            .map_err(|e| eyre!("Game sync error: {}", e))?
+        })
+        .await;
+
+    let (outputs, cache_overflowed, cache_milestone) = match sync_result {
+        Ok(outputs) => outputs,
+        Err(simplest_game_sync::GameSyncError::CachePositionNotFound {
+            player_id,
+            position,
+        }) => {
+            let data = packet_util::build_game_chat_packet(
+                b"Server",
+                b"Game Data Error! Game state will be inconsistent!",
+            );
+            util::send_packet(&state, src, msg::GAME_CHAT, data).await?;
+            return Err(eyre!(
+                "Cache miss: player {} position {} not found",
+                player_id,
+                position
+            ));
+        }
+        Err(e) => return Err(eyre!("Game sync error: {}", e)),
     };
+
+    if let Some(n) = cache_milestone {
+        let msg_text = format!("[Debug] cache {}/256", n);
+        let data = crate::packet_util::build_game_chat_packet(b"Server", msg_text.as_bytes());
+        util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, data).await?;
+    }
+    if cache_overflowed {
+        let data =
+            crate::packet_util::build_game_chat_packet(b"Server", b"[Debug] cache evicted (256+)");
+        util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, data).await?;
+    }
 
     // Send outputs to respective players
     let game_info = state
@@ -186,30 +257,42 @@ pub async fn handle_game_cache(
             ),
         };
 
-        debug!(
-            { fields::PLAYER_ID } = output.player_id,
-            message_type = msg::message_type_name(message_type),
-            { fields::DATA_LENGTH } = data_to_send.len(),
-            "Sending cache data to player"
-        );
         util::send_packet(&state, &target_addr, message_type, data_to_send).await?;
     }
+
+    metrics::histogram!(
+        "game_sync_processing_seconds",
+        "type" => "game_data",
+        "player_count" => game_info.players.len().to_string(),
+    )
+    .record(start.elapsed().as_secs_f64());
 
     Ok(())
 }
 
+#[tracing::instrument(skip(message, state), fields(
+    addr = %src,
+    username = tracing::field::Empty,
+    session_id = tracing::field::Empty,
+    game_id = tracing::field::Empty,
+))]
 pub async fn handle_ready_to_play_signal(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    let start = Instant::now();
     use tracing::info;
     debug!("Ready to play signal received");
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = buf.get_u8(); // Empty String
 
+    if let Some(client) = state.get_client(src).await {
+        util::record_session_fields(&client);
+    }
+
     state
-        .update_client::<_, (), color_eyre::Report>(src, |client_info| {
+        .update_client(src, |client_info| {
             client_info.player_status = PLAYER_STATUS_NET_SYNC; // Ready to play
             Ok(())
         })
@@ -252,7 +335,7 @@ pub async fn handle_ready_to_play_signal(
     if all_user_ready_to_signal {
         for player in &game_info_clone.players {
             let _ = state
-                .update_client::<_, (), color_eyre::Report>(&player.addr, |client_info| {
+                .update_client(&player.addr, |client_info| {
                     client_info.player_status = PLAYER_STATUS_PLAYING;
                     Ok(())
                 })
@@ -270,5 +353,6 @@ pub async fn handle_ready_to_play_signal(
         util::broadcast_packet_to_game(&state, game_info_clone.game_id, msg::READY_TO_PLAY, data)
             .await?;
     }
+    util::record_processing_time("ready_to_play", start.elapsed());
     Ok(())
 }

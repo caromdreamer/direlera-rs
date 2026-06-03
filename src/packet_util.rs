@@ -28,10 +28,6 @@ pub async fn handle_control_socket(
         }
         // Handle the PING message
         else if data == b"PING\x00" {
-            debug!(
-                { fields::ADDR } = %src,
-                "PING request received on control socket"
-            );
             let response = b"PONG\x00".to_vec();
             control_socket.send_to(&response, src).await?;
         } else {

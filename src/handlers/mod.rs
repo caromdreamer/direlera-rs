@@ -15,19 +15,20 @@ use crate::*;
 // For tracing, all arguments except those listed in skip() will be captured.
 // Always use English comments.
 // Only skip 'state' and 'message' in tracing, do not skip 'src' so that 'src' appears in tracing logs.
-#[instrument(skip(state, message))]
+#[instrument(level = "debug", skip(state, message))]
 pub async fn handle_message(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
+    metrics::counter!("packets_received_total", "type" => crate::kaillera::message_types::message_type_name(message.message_type)).increment(1);
     match message.message_type {
         msg::USER_QUIT => user::handle_user_quit(message, src, state).await?,
         msg::USER_LOGIN => user::handle_user_login(message, src, state).await?,
         msg::CLIENT_TO_SERVER_ACK => handle_client_to_server_ack(src, state).await?,
         msg::GLOBAL_CHAT => chat::handle_global_chat(message, src, state).await?,
         msg::GAME_CHAT => chat::handle_game_chat(message, src, state).await?,
-        msg::CLIENT_KEEP_ALIVE => handle_client_keep_alive(message, src).await?,
+        msg::CLIENT_KEEP_ALIVE => handle_client_keep_alive(message, src, state).await?,
         msg::CREATE_GAME => game::handle_create_game(message, src, state).await?,
         msg::QUIT_GAME => game::handle_quit_game(message.data, src, state).await?,
         msg::JOIN_GAME => game::handle_join_game(message, src, state).await?,
@@ -63,7 +64,7 @@ pub async fn handle_client_to_server_ack(
     // Average of last 5 measurements, excluding the first measurement
     // and update ack count
     let ack_count = state
-        .update_client::<_, u16, color_eyre::Report>(src, |client_info| {
+        .update_client(src, |client_info| {
             if let Some(last_ping_time) = client_info.last_ping_time {
                 // Calculate round-trip time (RTT) from when we sent SERVER_TO_CLIENT_ACK
                 let current_rtt = last_ping_time.elapsed().as_millis() as u32;
@@ -112,8 +113,13 @@ pub async fn handle_client_to_server_ack(
 
 pub async fn handle_client_keep_alive(
     _message: kaillera::protocol::ParsedMessage,
-    _src: &std::net::SocketAddr,
+    src: &std::net::SocketAddr,
+    state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
-    // No additional handling needed
+    // Send SERVER_STATUS to keep the NAT mapping alive in both directions.
+    // Without this, the server→client NAT entry expires (~30-60s) while the
+    // client keeps sending keep-alives, making the server's responses invisible.
+    let data = util::make_server_status(src, &state).await?;
+    util::send_packet(&state, src, msg::SERVER_STATUS, data).await?;
     Ok(())
 }

@@ -7,13 +7,19 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{info, warn, Instrument};
 
 use crate::{fields, packet_util, AppState};
 
 /// Configuration for session timeout behavior
 const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
+
+/// Stall recovery: if a playing client hasn't sent game input for this long, it
+/// likely missed a server->client packet (lockstep freeze). Resend its last
+/// packet so it can catch up. Checked every STALL_RESEND_INTERVAL.
+const STALL_THRESHOLD: Duration = Duration::from_millis(100);
+const STALL_RESEND_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Represents a single UDP "session" - simulating TCP connection
 struct UdpSession {
@@ -179,6 +185,58 @@ impl SessionManager {
     }
 }
 
+/// Periodically resend the last packet to any playing client that has stalled
+/// (stopped sending game input). In lockstep, a client that misses a server->client
+/// combined frame stops advancing and stops sending input, deadlocking the game.
+/// Resending the last packet (verbatim, same message numbers) lets it recover;
+/// already-processed messages are deduped by the client.
+pub fn start_stall_resend_task(global_state: Arc<AppState>) {
+    tokio::spawn(async move {
+        info!("Stall resend task started");
+        loop {
+            tokio::time::sleep(STALL_RESEND_INTERVAL).await;
+            let now = Instant::now();
+
+            // Collect addresses of stalled players in playing games.
+            let stalled: Vec<SocketAddr> = {
+                let game_ids: Vec<u32> =
+                    { global_state.games.read().await.keys().copied().collect() };
+                let mut out = Vec::new();
+                for gid in game_ids {
+                    if let Some(game) = global_state.get_game(gid).await {
+                        if game.game_status != crate::state::GAME_STATUS_PLAYING {
+                            continue;
+                        }
+                        for p in &game.players {
+                            if let Some(last) = p.last_game_data_recv {
+                                if now.duration_since(last) >= STALL_THRESHOLD {
+                                    out.push(p.addr);
+                                }
+                            }
+                        }
+                    }
+                }
+                out
+            };
+
+            // Resend each stalled client's last packet verbatim (same msg numbers).
+            for addr in stalled {
+                let last = {
+                    let addr_map = global_state.clients_by_addr.read().await;
+                    let id_map = global_state.clients_by_id.read().await;
+                    addr_map
+                        .get(&addr)
+                        .and_then(|sid| id_map.get(sid))
+                        .and_then(|c| c.packet_generator.last_sent())
+                };
+                if let Some(data) = last {
+                    let _ = global_state.tx.send(crate::Message { data, addr }).await;
+                }
+            }
+        }
+    });
+}
+
 /// Handle a single session - this is like handling a TCP connection
 async fn handle_session(
     addr: SocketAddr,
@@ -186,8 +244,12 @@ async fn handle_session(
     sessions: Arc<RwLock<HashMap<SocketAddr, UdpSession>>>,
     global_state: Arc<AppState>,
 ) {
+    let span = tracing::info_span!("session", addr = %addr);
     async move {
         info!("Session handler started");
+
+        // Per-session packet counter — no global lock needed
+        let mut packet_counter: u16 = 0;
 
         // Session loop - similar to TCP recv loop
         loop {
@@ -201,13 +263,16 @@ async fn handle_session(
                         }
                     }
 
-                    debug!({ fields::PACKET_SIZE } = data.len(), "Received packet");
-
-                    // Process the packet
-                    crate::process_packet_in_session(data, addr, global_state.clone()).await;
+                    global_state.update_client_activity(&addr).await;
+                    crate::process_packet_in_session(
+                        data,
+                        addr,
+                        global_state.clone(),
+                        &mut packet_counter,
+                    )
+                    .await;
                 }
                 Ok(None) => {
-                    info!("Session channel closed");
                     // Notify lobby and perform quit if necessary before breaking
                     if let Some(client_info) = global_state.get_client(&addr).await {
                         if client_info.game_id.is_some() {
@@ -237,8 +302,21 @@ async fn handle_session(
                 }
                 Err(_) => {
                     warn!(timeout_duration = ?SESSION_TIMEOUT, "Session timeout");
-                    // Notify lobby and perform quit if necessary before breaking
+                    use crate::kaillera::message_types as msg;
                     if let Some(client_info) = global_state.get_client(&addr).await {
+                        let username = crate::handlers::util::bytes_for_log(&client_info.username);
+                        // 글로벌 채팅으로 타임아웃 알림 (디버깅용)
+                        let notice =
+                            format!("[Server] {} timed out (keepalive not received)", username);
+                        let data =
+                            packet_util::build_global_chat_packet(b"Server", notice.as_bytes());
+                        let _ = crate::handlers::util::broadcast_packet(
+                            &global_state,
+                            msg::GLOBAL_CHAT,
+                            data,
+                        )
+                        .await;
+
                         if client_info.game_id.is_some() {
                             let _ = crate::handlers::game::handle_quit_game(
                                 vec![0x00, 0xFF, 0xFF],
@@ -248,7 +326,6 @@ async fn handle_session(
                             .await;
                         }
                         if let Some(removed) = global_state.remove_client(&addr).await {
-                            use crate::kaillera::message_types as msg;
                             let data = packet_util::build_user_quit_packet(
                                 &removed.username,
                                 removed.user_id,
@@ -261,6 +338,17 @@ async fn handle_session(
                             )
                             .await;
                         }
+                    } else {
+                        // 로그인 안 한 채 타임아웃 (주소만 알림)
+                        let notice = format!("[Server] {} timed out (no login)", addr);
+                        let data =
+                            packet_util::build_global_chat_packet(b"Server", notice.as_bytes());
+                        let _ = crate::handlers::util::broadcast_packet(
+                            &global_state,
+                            msg::GLOBAL_CHAT,
+                            data,
+                        )
+                        .await;
                     }
                     break;
                 }
@@ -278,5 +366,6 @@ async fn handle_session(
 
         info!("Session terminated");
     }
+    .instrument(span)
     .await
 }

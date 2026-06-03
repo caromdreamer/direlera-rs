@@ -12,6 +12,30 @@ Feel free to start or join a game.
 おはようございます...
 """
 
+# To register this server on the Kaillera master server list, uncomment and fill in
+# the [master_list] section below, then uncomment any [[master_list.servers]] entries
+# you want to report to.
+#
+# [master_list]
+# enabled = true
+# server_name = "My Kaillera Server"
+# server_address = "1.2.3.4"   # optional: omit to auto-detect public IP
+# server_location = "KR"
+# server_website = "http://example.com"
+# max_users = 100
+# max_games = 50
+#
+# [[master_list.servers]]
+# preset = "kaillera"          # http://www.kaillera.com/touch_server.php
+#
+# [[master_list.servers]]
+# preset = "emulinker"         # http://kaillerareborn.2manygames.fr/touch_list.php
+#
+# # Custom / private master server:
+# [[master_list.servers]]
+# url = "http://my-private-master.example.com/touch.php"
+# protocol = "kaillera"        # or "emulinker"
+
 # Tracing configuration
 # Format options: "pretty", "compact", "json"
 # - pretty: human-readable multi-line format (best for development)
