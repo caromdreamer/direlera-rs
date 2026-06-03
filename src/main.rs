@@ -15,6 +15,7 @@ mod state;
 mod handlers;
 use handlers::*;
 
+mod master_list;
 mod session_manager;
 
 mod simplest_game_sync;
@@ -36,6 +37,8 @@ pub struct Config {
     pub metrics_enabled: bool,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    #[serde(default)]
+    pub master_list: MasterListConfig,
 }
 
 impl Default for Config {
@@ -47,6 +50,7 @@ impl Default for Config {
             welcome_message: default_welcome_message(),
             metrics_enabled: false,
             metrics_port: default_metrics_port(),
+            master_list: MasterListConfig::default(),
         }
     }
 }
@@ -67,6 +71,109 @@ impl Default for TracingConfig {
         }
     }
 }
+
+// ── Master server list ──────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MasterListConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default)]
+    pub server_name: String,
+    /// Public IP or hostname that clients use to connect.
+    #[serde(default)]
+    pub server_address: String,
+    #[serde(default)]
+    pub server_location: String,
+    #[serde(default)]
+    pub server_website: String,
+    #[serde(default = "master_default_max_users")]
+    pub max_users: u32,
+    #[serde(default = "master_default_max_games")]
+    pub max_games: u32,
+    /// List of master servers to report to. Defaults to the two official servers
+    /// when omitted. Add any number of entries to report to additional endpoints.
+    #[serde(default = "default_master_servers")]
+    pub servers: Vec<MasterServerConfig>,
+}
+
+impl Default for MasterListConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            server_name: String::new(),
+            server_address: String::new(),
+            server_location: String::new(),
+            server_website: String::new(),
+            max_users: master_default_max_users(),
+            max_games: master_default_max_games(),
+            servers: default_master_servers(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct MasterServerConfig {
+    #[serde(flatten)]
+    pub endpoint: MasterEndpoint,
+}
+
+/// Either a named preset (URL + protocol bundled) or a fully custom entry.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum MasterEndpoint {
+    Preset { preset: MasterPreset },
+    Custom { url: String, protocol: MasterProtocol },
+}
+
+/// Built-in named servers — no URL to memorize.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(rename_all = "lowercase")]
+pub enum MasterPreset {
+    /// http://www.kaillera.com/touch_server.php
+    Kaillera,
+    /// http://kaillerareborn.2manygames.fr/touch_list.php
+    Emulinker,
+}
+
+impl MasterPreset {
+    pub fn url(&self) -> &'static str {
+        match self {
+            MasterPreset::Kaillera => "http://www.kaillera.com/touch_server.php",
+            MasterPreset::Emulinker => "http://kaillerareborn.2manygames.fr/touch_list.php",
+        }
+    }
+
+    pub fn protocol(&self) -> MasterProtocol {
+        match self {
+            MasterPreset::Kaillera => MasterProtocol::Kaillera,
+            MasterPreset::Emulinker => MasterProtocol::Emulinker,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[serde(rename_all = "lowercase")]
+pub enum MasterProtocol {
+    /// kaillera.com-style: query params servername/nbusers/ip/…
+    Kaillera,
+    /// EmuLinkerReborn-style: query params serverName/numUsers/ipAddress/…
+    Emulinker,
+}
+
+fn default_master_servers() -> Vec<MasterServerConfig> {
+    vec![]
+}
+
+fn master_default_max_users() -> u32 {
+    100
+}
+
+fn master_default_max_games() -> u32 {
+    50
+}
+
+// ────────────────────────────────────────────────────────────────────────────
 
 fn default_metrics_port() -> u16 {
     9091
@@ -239,6 +346,8 @@ async fn main() -> color_eyre::Result<()> {
     tokio::spawn(async move {
         manager_for_run.run(packet_rx, state_for_sessions).await;
     });
+
+    tokio::spawn(master_list::run(global_state.clone()));
 
     info!("Server initialization complete");
 

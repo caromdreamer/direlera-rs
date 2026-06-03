@@ -22,6 +22,7 @@ color-eyre = "0.6.5"
 encoding_rs = "0.8"
 metrics = "0.24"
 metrics-exporter-prometheus = { version = "0.16", default-features = false, features = ["http-listener"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 
 
 [profile.release]
