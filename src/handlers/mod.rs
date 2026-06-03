@@ -113,13 +113,15 @@ pub async fn handle_client_to_server_ack(
 
 pub async fn handle_client_keep_alive(
     _message: kaillera::protocol::ParsedMessage,
-    src: &std::net::SocketAddr,
-    state: Arc<AppState>,
+    _src: &std::net::SocketAddr,
+    _state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
-    // Send SERVER_STATUS to keep the NAT mapping alive in both directions.
-    // Without this, the server→client NAT entry expires (~30-60s) while the
-    // client keeps sending keep-alives, making the server's responses invisible.
-    let data = util::make_server_status(src, &state).await?;
-    util::send_packet(&state, src, msg::SERVER_STATUS, data).await?;
+    // Matching EmuLinker-K (KeepAliveAction): keep-alive only refreshes the
+    // client's activity timestamp, which already happens in the session loop
+    // (update_client_activity). The server sends NO response.
+    //
+    // Previously this re-sent SERVER_STATUS (the full user+game list) on every
+    // keep-alive. Clients append received list entries, so the periodic re-send
+    // made the same users pile up — showing duplicate users in the list.
     Ok(())
 }
