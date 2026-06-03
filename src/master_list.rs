@@ -133,7 +133,7 @@ struct EmulinkerTouch<'a> {
 async fn report(client: &Client, state: &AppState, server_address: &str) {
     let config = &state.config;
     let ml = &config.master_list;
-    let port = config.main_port.to_string();
+    let port = config.control_port.to_string();
 
     let (users, total_games, waiting) = collect(state).await;
 
