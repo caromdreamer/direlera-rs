@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::{debug, info, warn, Instrument};
 
 use crate::{fields, packet_util, AppState};
 
@@ -186,6 +186,7 @@ async fn handle_session(
     sessions: Arc<RwLock<HashMap<SocketAddr, UdpSession>>>,
     global_state: Arc<AppState>,
 ) {
+    let span = tracing::info_span!("session", { fields::ADDR } = %addr);
     async move {
         info!("Session handler started");
 
@@ -310,5 +311,6 @@ async fn handle_session(
 
         info!("Session terminated");
     }
+    .instrument(span)
     .await
 }

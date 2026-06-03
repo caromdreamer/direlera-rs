@@ -479,7 +479,6 @@ async fn process_packet_in_session(
                 "empty".to_string()
             };
             warn!(
-                { fields::ADDR } = %addr,
                 { fields::PACKET_SIZE } = data.len(),
                 { fields::ERROR } = %e,
                 packet_preview = preview,
