@@ -122,8 +122,13 @@ pub struct MasterServerConfig {
 #[derive(Debug, Deserialize, Clone)]
 #[serde(untagged)]
 pub enum MasterEndpoint {
-    Preset { preset: MasterPreset },
-    Custom { url: String, protocol: MasterProtocol },
+    Preset {
+        preset: MasterPreset,
+    },
+    Custom {
+        url: String,
+        protocol: MasterProtocol,
+    },
 }
 
 /// Built-in named servers — no URL to memorize.
@@ -272,7 +277,10 @@ async fn main() -> color_eyre::Result<()> {
             .expect("Failed to set histogram buckets")
             .install()
             .expect("Failed to start Prometheus metrics exporter");
-        info!(port = config.metrics_port, "Prometheus metrics exporter started");
+        info!(
+            port = config.metrics_port,
+            "Prometheus metrics exporter started"
+        );
     } else {
         info!("Prometheus metrics exporter disabled");
     }

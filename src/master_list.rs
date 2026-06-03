@@ -171,7 +171,12 @@ async fn touch_kaillera(
     // format: {id}|{romName}|{ownerName}|{emulator}|{playerCount}|
     let wgames: String = waiting
         .iter()
-        .map(|g| format!("{}|{}|{}|{}|{}|", g.id, g.name, g.owner, g.emulator, g.players))
+        .map(|g| {
+            format!(
+                "{}|{}|{}|{}|{}|",
+                g.id, g.name, g.owner, g.emulator, g.players
+            )
+        })
         .collect();
 
     let result = client
@@ -193,7 +198,11 @@ async fn touch_kaillera(
         .await;
 
     match result {
-        Ok(resp) => debug!(url, status = resp.status().as_u16(), "Kaillera master touched"),
+        Ok(resp) => debug!(
+            url,
+            status = resp.status().as_u16(),
+            "Kaillera master touched"
+        ),
         Err(e) => warn!(url, error = %e, "Failed to touch Kaillera master"),
     }
 }
@@ -240,7 +249,11 @@ async fn touch_emulinker(
         .await;
 
     match result {
-        Ok(resp) => debug!(url, status = resp.status().as_u16(), "EmuLinker master touched"),
+        Ok(resp) => debug!(
+            url,
+            status = resp.status().as_u16(),
+            "EmuLinker master touched"
+        ),
         Err(e) => warn!(url, error = %e, "Failed to touch EmuLinker master"),
     }
 }
