@@ -186,7 +186,7 @@ async fn handle_session(
     sessions: Arc<RwLock<HashMap<SocketAddr, UdpSession>>>,
     global_state: Arc<AppState>,
 ) {
-    let span = tracing::info_span!("session", { fields::ADDR } = %addr);
+    let span = tracing::info_span!("session", addr = %addr);
     async move {
         info!("Session handler started");
 
