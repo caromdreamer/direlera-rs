@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
-const VERSION: &str = concat!("direlera/", env!("CARGO_PKG_VERSION"));
+const VERSION: &str = "direlera";
 const INITIAL_DELAY: Duration = Duration::from_secs(10);
 const TOUCH_INTERVAL: Duration = Duration::from_secs(60);
 
