@@ -30,7 +30,8 @@ pub enum ServerResponse {
     GameCache(u8),
 }
 
-/// FIFO cache with 256 slots (rolls over to 0 when full)
+/// FIFO cache with 256 slots. Positions are logical (0 = oldest, size-1 = newest),
+/// matching the kaillera protocol spec and EmuLinker-K's FastGameDataCache behavior.
 #[derive(Debug, Clone)]
 pub struct InputCache {
     slots: VecDeque<Vec<u8>>,
@@ -57,15 +58,18 @@ impl InputCache {
     }
 
     /// Find data in cache, returning the logical position if found. O(1).
+    /// Logical position: 0 = oldest entry, size-1 = newest entry.
     pub fn find(&self, data: &[u8]) -> Option<u8> {
         let indices = self.index_map.get(data)?;
         let &abs_last = indices.back()?;
         let head = self.abs_tail - self.slots.len();
-        if abs_last >= head {
-            Some((abs_last % 256) as u8)
-        } else {
-            None
-        }
+        // index_map only ever holds live entries: eviction pops the evicted abs index
+        // (push()), so any abs found here is always within [head, abs_tail).
+        debug_assert!(
+            abs_last >= head,
+            "index_map holds stale entry: abs_last={abs_last}, head={head}"
+        );
+        Some((abs_last - head) as u8)
     }
 
     /// Add data to cache (evicts oldest slot when full). Returns true if eviction occurred.
@@ -98,11 +102,9 @@ impl InputCache {
         evicted
     }
 
-    /// Get data at circular buffer position (absIndex % 256).
+    /// Get data at logical position (0 = oldest, size-1 = newest).
     pub fn get(&self, pos: u8) -> Option<&[u8]> {
-        let head = self.abs_tail - self.slots.len();
-        let vdeque_idx = (pos as usize + 256 - head % 256) % 256;
-        self.slots.get(vdeque_idx).map(|v| v.as_slice())
+        self.slots.get(pos as usize).map(|v| v.as_slice())
     }
 
     pub fn len(&self) -> usize {
@@ -1043,5 +1045,63 @@ mod tests {
                 },
             ]
         )
+    }
+
+    /// Verify logical-index semantics survive cache eviction (256+ entries).
+    /// Before the fix, find() returned abs%256 so position 0 pointed to the newest
+    /// entry after the first wrap-around instead of the oldest — causing wrong key replay.
+    #[test]
+    fn test_input_cache_logical_positions_after_eviction() {
+        let mut cache = InputCache::new();
+
+        // Fill cache with 256 unique entries.
+        for i in 0u8..=255 {
+            cache.push(vec![i, 0]);
+        }
+        assert_eq!(cache.len(), 256);
+        // Position 0 = oldest = [0, 0], position 255 = newest = [255, 0].
+        assert_eq!(cache.find(&[0, 0]), Some(0));
+        assert_eq!(cache.find(&[255, 0]), Some(255));
+        assert_eq!(cache.get(0), Some([0u8, 0].as_ref()));
+        assert_eq!(cache.get(255), Some([255u8, 0].as_ref()));
+
+        // Push one more entry — evicts [0, 0].  New entry [100, 1] lands at pos 255.
+        cache.push(vec![100, 1]);
+        assert_eq!(cache.len(), 256);
+        assert_eq!(
+            cache.find(&[0, 0]),
+            None,
+            "[0,0] was evicted, must not be found"
+        );
+        assert_eq!(
+            cache.find(&[100, 1]),
+            Some(255),
+            "newest entry must be at logical pos 255"
+        );
+        assert_eq!(
+            cache.find(&[1, 0]),
+            Some(0),
+            "oldest surviving entry must be at logical pos 0"
+        );
+        assert_eq!(cache.get(255), Some([100u8, 1].as_ref()));
+        assert_eq!(cache.get(0), Some([1u8, 0].as_ref()));
+    }
+
+    /// Verify output cache positions sent to clients remain consistent after eviction.
+    #[test]
+    fn test_output_cache_position_after_eviction() {
+        let mut cache = InputCache::new();
+        // Push 257 unique entries (i as two bytes) so one eviction occurs.
+        // i=0 → [0,0], i=1 → [0,1], ..., i=255 → [0,255], i=256 → [1,0]
+        for i in 0u16..257 {
+            cache.push(vec![(i >> 8) as u8, (i & 0xFF) as u8]);
+        }
+        // [0,0] (abs 0) was evicted; [0,1] (abs 1) is oldest at pos 0; [1,0] (abs 256) is newest at pos 255.
+        assert_eq!(cache.find(&[0, 0]), None, "[0,0] was evicted");
+        assert_eq!(cache.find(&[0, 1]), Some(0), "oldest surviving = pos 0");
+        assert_eq!(cache.find(&[0, 255]), Some(254), "abs 255 = pos 254");
+        assert_eq!(cache.find(&[1, 0]), Some(255), "newest entry = pos 255");
+        assert_eq!(cache.get(0), Some([0u8, 1].as_ref()));
+        assert_eq!(cache.get(255), Some([1u8, 0].as_ref()));
     }
 }
