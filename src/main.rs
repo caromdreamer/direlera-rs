@@ -402,6 +402,13 @@ async fn main() -> color_eyre::Result<()> {
         };
         let data = buf[..len].to_vec();
 
+        // PING probe — respond immediately without creating a session
+        if data == b"PING\x00" {
+            debug!({ fields::ADDR } = %src, "PING received on main port");
+            let _ = main_socket.send_to(b"PONG\x00", src).await;
+            continue;
+        }
+
         debug!(
             { fields::ADDR } = %src,
             { fields::PACKET_SIZE } = len,
