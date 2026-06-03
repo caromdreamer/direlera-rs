@@ -71,17 +71,11 @@ impl InputCache {
     /// Add data to cache (evicts oldest slot when full). Returns true if eviction occurred.
     pub fn push(&mut self, data: Vec<u8>) -> bool {
         let evicted = if self.slots.len() >= 256 {
-            // KNOWN BUG: after this eviction the server's VecDeque-relative positions
-            // (0 = oldest) diverge from the client's circular-buffer positions
-            // (abs_index % 256). All subsequent cache hits will reference wrong frames,
-            // causing game desyncs. This counter lets us observe when it happens.
             metrics::counter!("game_cache_overflow_total").increment(1);
             if self.abs_tail == 256 {
-                // first eviction ever for this cache instance
                 error!(
                     abs_tail = self.abs_tail,
-                    "Game cache hit 256 entries and is now evicting — \
-                     cache positions will desync from client (known bug)"
+                    "Game cache hit 256 entries and is now evicting"
                 );
             }
             let evicted = self.slots.pop_front().unwrap();
@@ -104,9 +98,11 @@ impl InputCache {
         evicted
     }
 
-    /// Get data at logical position.
+    /// Get data at circular buffer position (absIndex % 256).
     pub fn get(&self, pos: u8) -> Option<&[u8]> {
-        self.slots.get(pos as usize).map(|v| v.as_slice())
+        let head = self.abs_tail - self.slots.len();
+        let vdeque_idx = (pos as usize + 256 - head % 256) % 256;
+        self.slots.get(vdeque_idx).map(|v| v.as_slice())
     }
 
     pub fn len(&self) -> usize {
