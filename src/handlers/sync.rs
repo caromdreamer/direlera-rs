@@ -60,7 +60,7 @@ pub async fn handle_game_data(
     );
 
     // Process with SimpleGameSync (per-game lock — does not block other games)
-    let outputs = state
+    let (outputs, cache_overflowed, cache_milestone) = state
         .update_game(game_id, |game_info| {
             // Jitter: consecutive inter-arrival time difference for this player
             let now = Instant::now();
@@ -93,6 +93,17 @@ pub async fn handle_game_data(
                 .map_err(|e| eyre!("Game sync error: {}", e))
         })
         .await?;
+
+    if let Some(n) = cache_milestone {
+        let msg_text = format!("[Debug] cache {}/256", n);
+        let data = crate::packet_util::build_game_chat_packet(b"Server", msg_text.as_bytes());
+        util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, data).await?;
+    }
+    if cache_overflowed {
+        let data =
+            crate::packet_util::build_game_chat_packet(b"Server", b"[Debug] cache evicted (256+)");
+        util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, data).await?;
+    }
 
     // Send outputs to respective players
     let game_info = state
@@ -196,7 +207,7 @@ pub async fn handle_game_cache(
         })
         .await;
 
-    let outputs = match sync_result {
+    let (outputs, cache_overflowed, cache_milestone) = match sync_result {
         Ok(outputs) => outputs,
         Err(simplest_game_sync::GameSyncError::CachePositionNotFound {
             player_id,
@@ -215,6 +226,17 @@ pub async fn handle_game_cache(
         }
         Err(e) => return Err(eyre!("Game sync error: {}", e)),
     };
+
+    if let Some(n) = cache_milestone {
+        let msg_text = format!("[Debug] cache {}/256", n);
+        let data = crate::packet_util::build_game_chat_packet(b"Server", msg_text.as_bytes());
+        util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, data).await?;
+    }
+    if cache_overflowed {
+        let data =
+            crate::packet_util::build_game_chat_packet(b"Server", b"[Debug] cache evicted (256+)");
+        util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, data).await?;
+    }
 
     // Send outputs to respective players
     let game_info = state

@@ -62,15 +62,15 @@ impl InputCache {
         let &abs_last = indices.back()?;
         let head = self.abs_tail - self.slots.len();
         if abs_last >= head {
-            Some((abs_last - head) as u8)
+            Some((abs_last % 256) as u8)
         } else {
             None
         }
     }
 
-    /// Add data to cache (evicts oldest slot when full).
-    pub fn push(&mut self, data: Vec<u8>) {
-        if self.slots.len() >= 256 {
+    /// Add data to cache (evicts oldest slot when full). Returns true if eviction occurred.
+    pub fn push(&mut self, data: Vec<u8>) -> bool {
+        let evicted = if self.slots.len() >= 256 {
             // KNOWN BUG: after this eviction the server's VecDeque-relative positions
             // (0 = oldest) diverge from the client's circular-buffer positions
             // (abs_index % 256). All subsequent cache hits will reference wrong frames,
@@ -91,18 +91,30 @@ impl InputCache {
                     self.index_map.remove(&evicted);
                 }
             }
-        }
+            true
+        } else {
+            false
+        };
         self.index_map
             .entry(data.clone())
             .or_default()
             .push_back(self.abs_tail);
         self.abs_tail += 1;
         self.slots.push_back(data);
+        evicted
     }
 
     /// Get data at logical position.
     pub fn get(&self, pos: u8) -> Option<&[u8]> {
         self.slots.get(pos as usize).map(|v| v.as_slice())
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
     }
 }
 
@@ -420,12 +432,15 @@ impl CachedGameSync {
         }
     }
 
-    /// Process client input with cache support
+    /// Process client input with cache support.
+    /// Returns (outputs, cache_overflowed, milestone) where:
+    /// - cache_overflowed: true if any output cache eviction occurred
+    /// - milestone: Some(n) if any output cache crossed a 64-entry boundary this call
     pub fn process_client_input(
         &mut self,
         player_id: usize,
         input: ClientInput,
-    ) -> Result<Vec<CachedPlayerOutput>, GameSyncError> {
+    ) -> Result<(Vec<CachedPlayerOutput>, bool, Option<usize>), GameSyncError> {
         // Validate player_id
         let player_count = self.sync.player_delays().len();
         if player_id >= player_count {
@@ -438,7 +453,6 @@ impl CachedGameSync {
         // Resolve input data from cache if needed
         let input_data = match input {
             ClientInput::GameData(data) => {
-                // Store in client's input cache
                 self.input_caches[player_id].push(data.clone());
                 data
             }
@@ -456,15 +470,25 @@ impl CachedGameSync {
 
         // Convert outputs to cached responses
         let mut results = Vec::new();
+        let mut cache_overflowed = false;
+        let mut milestone: Option<usize> = None;
         for raw_output in raw_outputs {
             let cached_output = if let Some(cache_pos) =
                 self.output_caches[raw_output.player_id].find(&raw_output.output)
             {
-                // Found in cache - use cache reference
                 ServerResponse::GameCache(cache_pos)
             } else {
-                // Not in cache - store and return full data
-                self.output_caches[raw_output.player_id].push(raw_output.output.clone());
+                let before = self.output_caches[raw_output.player_id].len();
+                let overflowed =
+                    self.output_caches[raw_output.player_id].push(raw_output.output.clone());
+                let after = self.output_caches[raw_output.player_id].len();
+                if overflowed {
+                    cache_overflowed = true;
+                }
+                // Check if we crossed a 64-entry boundary
+                if before / 64 != after / 64 {
+                    milestone = Some(after);
+                }
                 ServerResponse::GameData(raw_output.output)
             };
 
@@ -474,7 +498,7 @@ impl CachedGameSync {
             });
         }
 
-        Ok(results)
+        Ok((results, cache_overflowed, milestone))
     }
 
     /// Get player count
@@ -536,25 +560,25 @@ mod tests {
         let outputs = manager
             .process_client_input(0, ClientInput::GameData(vec![0x01, 0x02]))
             .unwrap();
-        assert_eq!(outputs.len(), 0);
+        assert_eq!(outputs.0.len(), 0);
 
         // Frame 1: P1 sends input
         let outputs = manager
             .process_client_input(1, ClientInput::GameData(vec![0x03, 0x04]))
             .unwrap();
-        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs.0.len(), 2);
 
-        assert_eq!(outputs[0].player_id, 0);
-        assert_eq!(outputs[1].player_id, 1);
+        assert_eq!(outputs.0[0].player_id, 0);
+        assert_eq!(outputs.0[1].player_id, 1);
 
-        match &outputs[0].response {
+        match &outputs.0[0].response {
             ServerResponse::GameData(data) => {
                 assert_eq!(data, &vec![0x01, 0x02, 0x03, 0x04]);
             }
             _ => panic!("P0's first output should be GameData"),
         }
 
-        match &outputs[1].response {
+        match &outputs.0[1].response {
             ServerResponse::GameData(data) => {
                 assert_eq!(data, &vec![0x01, 0x02, 0x03, 0x04]);
             }
@@ -569,9 +593,15 @@ mod tests {
             .process_client_input(1, ClientInput::GameCache(0))
             .unwrap();
 
-        assert_eq!(outputs.len(), 2);
-        assert!(matches!(outputs[0].response, ServerResponse::GameCache(_)));
-        assert!(matches!(outputs[1].response, ServerResponse::GameCache(_)));
+        assert_eq!(outputs.0.len(), 2);
+        assert!(matches!(
+            outputs.0[0].response,
+            ServerResponse::GameCache(_)
+        ));
+        assert!(matches!(
+            outputs.0[1].response,
+            ServerResponse::GameCache(_)
+        ));
     }
     #[test]
     fn test_equal_delays_drop() {
@@ -583,7 +613,7 @@ mod tests {
             .process_client_input(1, ClientInput::GameData(vec![0x04, 0x05, 0x06]))
             .unwrap();
         assert_eq!(
-            outputs,
+            outputs.0,
             vec![
                 CachedPlayerOutput {
                     player_id: 0,
@@ -605,7 +635,7 @@ mod tests {
         let outputs = manager
             .process_client_input(0, ClientInput::GameData(vec![0x01, 0x00]))
             .unwrap();
-        assert_eq!(outputs.len(), 0);
+        assert_eq!(outputs.0.len(), 0);
 
         // P0 sends second and third
         manager
@@ -614,7 +644,7 @@ mod tests {
         let outputs = manager
             .process_client_input(0, ClientInput::GameData(vec![0x03, 0x00]))
             .unwrap();
-        assert_eq!(outputs.len(), 0);
+        assert_eq!(outputs.0.len(), 0);
 
         // P1 sends 4 bytes (2 frames)
         // When P1 sends input, bundles are created from accumulated P0 frames
@@ -629,8 +659,8 @@ mod tests {
         // With the fixed logic:
         // - Bundle 1: [0x01, 0x00] + [0xAA, 0xBB] → P0 gets output immediately (4 bytes >= 4)
         // - Bundle 2: [0x02, 0x00] + [0xCC, 0xDD] → P0 gets another output (4 bytes >= 4), P1 gets output (8 bytes >= 8)
-        let p0_outputs: Vec<_> = outputs.iter().filter(|o| o.player_id == 0).collect();
-        let p1_outputs: Vec<_> = outputs.iter().filter(|o| o.player_id == 1).collect();
+        let p0_outputs: Vec<_> = outputs.0.iter().filter(|o| o.player_id == 0).collect();
+        let p1_outputs: Vec<_> = outputs.0.iter().filter(|o| o.player_id == 1).collect();
 
         // P0 should get 2 outputs (one after each bundle, since delay 1 needs 4 bytes = 1 bundle)
         assert_eq!(
@@ -694,8 +724,8 @@ mod tests {
             .process_client_input(1, ClientInput::GameData(vec![0x00, 0x00]))
             .unwrap();
 
-        assert_eq!(outputs.len(), 2);
-        assert!(matches!(outputs[0].response, ServerResponse::GameData(_)));
+        assert_eq!(outputs.0.len(), 2);
+        assert!(matches!(outputs.0[0].response, ServerResponse::GameData(_)));
 
         manager
             .process_client_input(0, ClientInput::GameCache(0))
@@ -705,6 +735,7 @@ mod tests {
             .unwrap();
 
         let has_cache = outputs
+            .0
             .iter()
             .any(|o| matches!(o.response, ServerResponse::GameCache(_)));
         assert!(has_cache);
@@ -721,16 +752,16 @@ mod tests {
             .process_client_input(1, ClientInput::GameData(vec![0x02, 0x00]))
             .unwrap();
 
-        assert_eq!(outputs.len(), 0); // P2 hasn't sent input yet
+        assert_eq!(outputs.0.len(), 0); // P2 hasn't sent input yet
 
         // P2 sends input
         let outputs = manager
             .process_client_input(2, ClientInput::GameData(vec![0x03, 0x00, 0x04, 0x00]))
             .unwrap();
 
-        assert!(outputs.len() >= 2);
-        let p0_outputs: Vec<_> = outputs.iter().filter(|o| o.player_id == 0).collect();
-        let p1_outputs: Vec<_> = outputs.iter().filter(|o| o.player_id == 1).collect();
+        assert!(outputs.0.len() >= 2);
+        let p0_outputs: Vec<_> = outputs.0.iter().filter(|o| o.player_id == 0).collect();
+        let p1_outputs: Vec<_> = outputs.0.iter().filter(|o| o.player_id == 1).collect();
 
         assert_eq!(p0_outputs.len(), 1);
         assert_eq!(p1_outputs.len(), 1);
@@ -747,7 +778,7 @@ mod tests {
         let outputs = manager
             .process_client_input(1, ClientInput::GameData(vec![0xCC, 0xDD]))
             .unwrap();
-        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs.0.len(), 2);
 
         // Frame 2
         manager
@@ -756,7 +787,10 @@ mod tests {
         let outputs = manager
             .process_client_input(1, ClientInput::GameCache(0))
             .unwrap();
-        assert!(matches!(outputs[0].response, ServerResponse::GameCache(_)));
+        assert!(matches!(
+            outputs.0[0].response,
+            ServerResponse::GameCache(_)
+        ));
 
         // Frame 3
         manager
@@ -765,7 +799,10 @@ mod tests {
         let outputs = manager
             .process_client_input(1, ClientInput::GameCache(0))
             .unwrap();
-        assert!(matches!(outputs[0].response, ServerResponse::GameCache(_)));
+        assert!(matches!(
+            outputs.0[0].response,
+            ServerResponse::GameCache(_)
+        ));
 
         // Frame 4
         manager
@@ -774,7 +811,7 @@ mod tests {
         let outputs = manager
             .process_client_input(1, ClientInput::GameData(vec![0x33, 0x44]))
             .unwrap();
-        assert!(matches!(outputs[0].response, ServerResponse::GameData(_)));
+        assert!(matches!(outputs.0[0].response, ServerResponse::GameData(_)));
     }
 
     #[test]
@@ -787,7 +824,7 @@ mod tests {
         let outputs = manager
             .process_client_input(1, ClientInput::GameData(vec![0xCC, 0xDD, 0xCC, 0xDD]))
             .unwrap();
-        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs.0.len(), 2);
 
         manager
             .process_client_input(0, ClientInput::GameCache(0))
@@ -795,7 +832,10 @@ mod tests {
         let outputs = manager
             .process_client_input(1, ClientInput::GameCache(0))
             .unwrap();
-        assert!(matches!(outputs[0].response, ServerResponse::GameCache(_)));
+        assert!(matches!(
+            outputs.0[0].response,
+            ServerResponse::GameCache(_)
+        ));
     }
 
     #[test]
@@ -816,7 +856,7 @@ mod tests {
             .process_client_input(1, ClientInput::GameCache(0))
             .unwrap();
 
-        match &outputs[0].response {
+        match &outputs.0[0].response {
             ServerResponse::GameData(data) => {
                 assert_eq!(data, &vec![0x05, 0x06, 0x03, 0x04]);
             }
@@ -855,7 +895,10 @@ mod tests {
         let outputs = manager
             .process_client_input(1, ClientInput::GameCache(1))
             .unwrap();
-        assert!(matches!(outputs[0].response, ServerResponse::GameCache(_)));
+        assert!(matches!(
+            outputs.0[0].response,
+            ServerResponse::GameCache(_)
+        ));
 
         manager
             .process_client_input(0, ClientInput::GameCache(1))
@@ -863,7 +906,7 @@ mod tests {
         let outputs = manager
             .process_client_input(1, ClientInput::GameCache(1))
             .unwrap();
-        match &outputs[0].response {
+        match &outputs.0[0].response {
             ServerResponse::GameData(_) => {}
             _ => panic!("Should be GameData (new combination)"),
         }
@@ -880,7 +923,7 @@ mod tests {
             .process_client_input(1, ClientInput::GameData(vec![0x11, 0x22, 0x33, 0x44]))
             .unwrap();
 
-        assert_eq!(outputs.len(), 2);
+        assert_eq!(outputs.0.len(), 2);
     }
 
     #[test]
@@ -940,7 +983,7 @@ mod tests {
             .process_client_input(1, ClientInput::GameData(vec![0x03, 0x04, 0x05, 0x06]))
             .unwrap();
         assert_eq!(
-            result,
+            result.0,
             vec![CachedPlayerOutput {
                 player_id: 0,
                 response: ServerResponse::GameData(vec![0x01, 0x02, 0x03, 0x04])
@@ -950,7 +993,7 @@ mod tests {
             .process_client_input(0, ClientInput::GameData(vec![0x07, 0x08]))
             .unwrap();
         assert_eq!(
-            result,
+            result.0,
             vec![
                 CachedPlayerOutput {
                     player_id: 0,
@@ -976,7 +1019,7 @@ mod tests {
             .process_client_input(1, ClientInput::GameData(vec![0x03, 0x04]))
             .unwrap();
         assert_eq!(
-            result,
+            result.0,
             vec![
                 CachedPlayerOutput {
                     player_id: 0,
@@ -992,7 +1035,7 @@ mod tests {
             .process_client_input(1, ClientInput::GameData(vec![0x05, 0x06]))
             .unwrap();
         assert_eq!(
-            result,
+            result.0,
             vec![
                 CachedPlayerOutput {
                     player_id: 0,
