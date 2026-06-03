@@ -30,6 +30,8 @@ pub struct AppState {
 
     // Server configuration
     pub config: Arc<crate::Config>,
+
+    pub start_time: std::time::Instant,
 }
 
 impl AppState {
@@ -42,6 +44,7 @@ impl AppState {
             next_user_id: Arc::new(AtomicU16::new(1)),
             tx,
             config: Arc::new(config),
+            start_time: std::time::Instant::now(),
         }
     }
 

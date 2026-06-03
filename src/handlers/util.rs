@@ -523,8 +523,24 @@ pub async fn make_server_information(
     let encoding = detect_encoding_from_message(&state.config.welcome_message);
     info!("Encoding: {}", encoding.name());
 
+    // Append uptime to welcome message
+    let uptime = state.start_time.elapsed();
+    let uptime_secs = uptime.as_secs();
+    let days = uptime_secs / 86400;
+    let hours = (uptime_secs % 86400) / 3600;
+    let mins = (uptime_secs % 3600) / 60;
+    let secs = uptime_secs % 60;
+    let uptime_str = if days > 0 {
+        format!("{}d {}h {}m {}s", days, hours, mins, secs)
+    } else if hours > 0 {
+        format!("{}h {}m {}s", hours, mins, secs)
+    } else {
+        format!("{}m {}s", mins, secs)
+    };
+    let full_message = format!("{}\nUptime: {}", state.config.welcome_message, uptime_str);
+
     // Convert welcome message from UTF-8 (config.toml) to detected encoding
-    let (welcome_bytes, _, had_errors) = encoding.encode(&state.config.welcome_message);
+    let (welcome_bytes, _, had_errors) = encoding.encode(&full_message);
     if had_errors {
         debug!(
             encoding = encoding.name(),
