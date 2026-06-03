@@ -4,19 +4,6 @@ use std::sync::Arc;
 use std::time::Instant;
 use tracing::{debug, error, info, warn};
 
-/// EmuLinker-K formula: frameDelay = (60 / conn_type) * (ping_ms / 1000) + 1
-/// Falls back to conn_type when ping is not yet measured.
-fn calculate_frame_delay(conn_type: u8, ping_ms: u32) -> usize {
-    if conn_type == 0 {
-        return 1;
-    }
-    if ping_ms == 0 {
-        return conn_type as usize;
-    }
-    let delay = (60.0 / conn_type as f64 * ping_ms as f64 / 1000.0 + 1.0) as usize;
-    delay.max(1)
-}
-
 use super::util;
 use crate::kaillera::message_types as msg;
 use crate::simplest_game_sync;
@@ -522,38 +509,23 @@ pub async fn handle_start_game(
     let game_info_before = util::fetch_game_info(src, &state).await?;
     let players = game_info_before.players.clone();
 
-    // Collect per-player ping before entering the game mutex
-    let mut player_conn_pings: Vec<(u8, u32)> = Vec::new();
-    for player in &players {
-        let ping = state
-            .get_client(&player.addr)
-            .await
-            .map(|c| c.ping)
-            .unwrap_or(0);
-        player_conn_pings.push((player.conn_type, ping));
-    }
-
-    // Calculate frame delay per player, then equalize to the highest value.
-    // Players with lower latency absorb the difference implicitly; all clients
-    // receive the same delay value so their local input buffers stay aligned.
-    let frame_delays: Vec<usize> = player_conn_pings
+    // Use each player's conn_type directly as their frame delay.
+    // Kaillera clients use their own conn_type as delay regardless of the server's assignment,
+    // so the sync engine must match the actual packet cadence.
+    let delays: Vec<usize> = players
         .iter()
-        .map(|&(ct, ping)| calculate_frame_delay(ct, ping))
+        .map(|p| p.conn_type.max(1) as usize)
         .collect();
-    let max_delay = frame_delays.iter().copied().max().unwrap_or(1);
-    let uniform_delays = vec![max_delay; players.len()];
 
     info!(
-        max_delay,
-        player_delays = ?frame_delays,
+        player_delays = ?delays,
         "Calculated frame delays for game start"
     );
 
     // Initialize SimpleGameSync when game starts
-    let sync_delays = uniform_delays.clone();
     util::with_game_mut(&state, src, |game_info| {
         game_info.game_status = GAME_STATUS_PLAYING;
-        game_info.sync_manager = Some(simplest_game_sync::CachedGameSync::new(sync_delays));
+        game_info.sync_manager = Some(simplest_game_sync::CachedGameSync::new(delays.clone()));
     })
     .await?;
 
@@ -587,9 +559,9 @@ pub async fn handle_start_game(
     //     }
     // }
 
-    // Send start game notification with the equalized delay value
+    // Send start game notification with each player's own conn_type as delay
     for (i, player) in game_info.players.iter().enumerate() {
-        let player_delay = max_delay;
+        let player_delay = player.conn_type.max(1) as usize;
         let player_number = (i + 1) as u8;
         let total_players = game_info.players.len() as u8;
         debug!(
