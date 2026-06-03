@@ -348,6 +348,9 @@ async fn main() -> color_eyre::Result<()> {
         .clone()
         .start_cleanup_task(global_state.clone());
 
+    // Start NAT keepalive task — sends SERVER_STATUS every 25 s to prevent NAT mapping expiry
+    session_manager::start_nat_keepalive_task(global_state.clone());
+
     // Start session manager (spawns handlers for each client)
     let manager_for_run = session_manager.clone();
     let state_for_sessions = global_state.clone();

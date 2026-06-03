@@ -14,6 +14,8 @@ use crate::{fields, packet_util, AppState};
 /// Configuration for session timeout behavior
 const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
+/// Most consumer NATs expire idle UDP mappings in 30–60 s; send at 25 s to stay under that.
+const NAT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(25);
 
 /// Represents a single UDP "session" - simulating TCP connection
 struct UdpSession {
@@ -177,6 +179,38 @@ impl SessionManager {
             }
         });
     }
+}
+
+/// Periodically send SERVER_STATUS to all logged-in clients so their NAT mappings stay alive.
+pub fn start_nat_keepalive_task(global_state: Arc<AppState>) {
+    tokio::spawn(async move {
+        info!("NAT keepalive task started");
+        loop {
+            tokio::time::sleep(NAT_KEEPALIVE_INTERVAL).await;
+
+            let addrs = global_state.get_all_client_addrs().await;
+            for addr in addrs {
+                let ack_count = match global_state.get_client(&addr).await {
+                    Some(c) => c.ack_count,
+                    None => continue,
+                };
+                if ack_count < 3 {
+                    continue;
+                }
+                if let Ok(data) =
+                    crate::handlers::util::make_server_status(&addr, &global_state).await
+                {
+                    let _ = crate::handlers::util::send_packet(
+                        &global_state,
+                        &addr,
+                        crate::kaillera::message_types::SERVER_STATUS,
+                        data,
+                    )
+                    .await;
+                }
+            }
+        }
+    });
 }
 
 /// Handle a single session - this is like handling a TCP connection
