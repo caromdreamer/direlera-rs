@@ -512,18 +512,19 @@ fn detect_encoding_from_message(message: &str) -> &'static Encoding {
 pub async fn make_server_information(
     state: &AppState,
     _client_addr: &std::net::SocketAddr,
-) -> color_eyre::Result<Vec<u8>> {
-    // Prepare response data
+) -> color_eyre::Result<Vec<Vec<u8>>> {
+    // The Kaillera client renders each SERVER_INFORMATION message as a single
+    // chat line and truncates anything after the first embedded newline. So a
+    // multi-line welcome message must be sent as one packet *per line* (this is
+    // what EmuLinker-K does: one InfoMessageEvent per login message line).
     // '            NB : "Server\0"
     // '            NB : Message
-    let mut data = BytesMut::new();
-    data.put("Server\0".as_bytes());
 
     // Detect encoding based on welcome message content
     let encoding = detect_encoding_from_message(&state.config.welcome_message);
     info!("Encoding: {}", encoding.name());
 
-    // Append uptime to welcome message
+    // Build uptime line, appended after the configured welcome lines.
     let uptime = state.start_time.elapsed();
     let uptime_secs = uptime.as_secs();
     let days = uptime_secs / 86400;
@@ -537,21 +538,38 @@ pub async fn make_server_information(
     } else {
         format!("{}m {}s", mins, secs)
     };
-    let full_message = format!("{}\nUptime: {}", state.config.welcome_message, uptime_str);
 
-    // Convert welcome message from UTF-8 (config.toml) to detected encoding
-    let (welcome_bytes, _, had_errors) = encoding.encode(&full_message);
-    if had_errors {
-        debug!(
-            encoding = encoding.name(),
-            "Some characters could not be encoded, using lossy conversion"
-        );
+    // One payload per non-empty line; the Kaillera client can't render empty
+    // information messages, so blank lines (e.g. from the triple-quoted config
+    // string's leading/trailing newlines) are skipped.
+    let lines = state
+        .config
+        .welcome_message
+        .lines()
+        .map(str::to_string)
+        .chain(std::iter::once(format!("Uptime: {}", uptime_str)))
+        .filter(|line| !line.trim().is_empty());
+
+    let mut packets = Vec::new();
+    for line in lines {
+        let mut data = BytesMut::new();
+        data.put("Server\0".as_bytes());
+
+        // Convert line from UTF-8 (config.toml) to detected encoding
+        let (line_bytes, _, had_errors) = encoding.encode(&line);
+        if had_errors {
+            debug!(
+                encoding = encoding.name(),
+                "Some characters could not be encoded, using lossy conversion"
+            );
+        }
+
+        data.put(line_bytes.as_ref());
+        data.put_u8(0); // Null terminator
+        packets.push(data.to_vec());
     }
 
-    data.put(welcome_bytes.as_ref());
-    data.put_u8(0); // Null terminator
-
-    Ok(data.to_vec())
+    Ok(packets)
 }
 pub async fn make_server_status(
     src: &std::net::SocketAddr,

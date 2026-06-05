@@ -100,8 +100,13 @@ pub async fn handle_client_to_server_ack(
         let data = util::make_user_joined(src, &state).await?;
         util::broadcast_packet(&state, msg::USER_JOINED, data).await?;
 
-        let data = util::make_server_information(&state, src).await?;
-        util::send_packet(&state, src, msg::SERVER_INFORMATION, data).await?;
+        // Welcome message is sent one packet per line: the Kaillera client
+        // treats each SERVER_INFORMATION as a single chat line and truncates at
+        // the first embedded newline.
+        let info_lines = util::make_server_information(&state, src).await?;
+        for data in info_lines {
+            util::send_packet(&state, src, msg::SERVER_INFORMATION, data).await?;
+        }
     } else {
         // Server notification creation
         let data = packet_util::build_server_to_client_ack_packet();
