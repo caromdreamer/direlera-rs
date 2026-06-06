@@ -8,11 +8,7 @@ use tracing::info;
 use super::util;
 use crate::kaillera::message_types as msg;
 
-#[tracing::instrument(skip(message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_global_chat(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -27,14 +23,14 @@ pub async fn handle_global_chat(
     let chat_message = util::read_string_bytes(&mut buf);
 
     let username = if let Some(client_info) = state.get_client(src).await {
-        util::record_session_fields(&client_info);
         client_info.username.clone()
     } else {
         b"Unknown".to_vec()
     };
 
     info!(
-        "Global chat message: {}",
+        "[{}] {}",
+        util::bytes_to_string(&username),
         util::bytes_to_string(&chat_message)
     );
 
@@ -46,12 +42,7 @@ pub async fn handle_global_chat(
     Ok(())
 }
 
-#[tracing::instrument(skip(message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_game_chat(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -69,7 +60,6 @@ pub async fn handle_game_chat(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
-    util::record_session_fields(&client_info);
 
     let game_id = client_info
         .game_id
@@ -81,11 +71,7 @@ pub async fn handle_game_chat(
         .ok_or_else(|| eyre!("Game not found"))?;
     if !game_info.players.iter().any(|p| p.addr == *src) {
         use tracing::warn;
-        warn!(
-            { fields::USER_NAME } = client_info.username_str().as_str(),
-            { fields::GAME_ID } = game_id,
-            "User attempted game chat but not in game players list"
-        );
+        warn!("User attempted game chat but not in game players list");
         return Ok(());
     }
 
@@ -95,7 +81,8 @@ pub async fn handle_game_chat(
     }
 
     info!(
-        "Game chat message: {}",
+        "[{}] {}",
+        util::bytes_to_string(&client_info.username),
         util::bytes_to_string(&chat_message)
     );
 

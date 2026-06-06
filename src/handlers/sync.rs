@@ -14,10 +14,7 @@ use crate::*;
 - **2B**: Length of Game Data
 - **NB**: Game Data
  */
-#[tracing::instrument(level = "debug", skip(message, state), fields(
-    addr = %src,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
+#[tracing::instrument(level = "debug", skip_all, fields(
     player_id = tracing::field::Empty,
 ))]
 pub async fn handle_game_data(
@@ -36,9 +33,6 @@ pub async fn handle_game_data(
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
     let game_id = client.game_id.ok_or_else(|| eyre!("Game ID not found"))?;
-    tracing::Span::current()
-        .record("session_id", client.session_id.to_string().as_str())
-        .record("game_id", game_id);
 
     // Find player_id from address
     let game_info = state
@@ -140,10 +134,7 @@ pub async fn handle_game_data(
     Ok(())
 }
 
-#[tracing::instrument(level = "debug", skip(message, state), fields(
-    addr = %src,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
+#[tracing::instrument(level = "debug", skip_all, fields(
     player_id = tracing::field::Empty,
 ))]
 pub async fn handle_game_cache(
@@ -161,9 +152,6 @@ pub async fn handle_game_cache(
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
     let game_id = client.game_id.ok_or_else(|| eyre!("Game ID not found"))?;
-    tracing::Span::current()
-        .record("session_id", client.session_id.to_string().as_str())
-        .record("game_id", game_id);
 
     // Find player_id from address
     let game_info = state
@@ -270,12 +258,7 @@ pub async fn handle_game_cache(
     Ok(())
 }
 
-#[tracing::instrument(skip(message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_ready_to_play_signal(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -286,10 +269,6 @@ pub async fn handle_ready_to_play_signal(
     debug!("Ready to play signal received");
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = buf.get_u8(); // Empty String
-
-    if let Some(client) = state.get_client(src).await {
-        util::record_session_fields(&client);
-    }
 
     state
         .update_client(src, |client_info| {
@@ -315,17 +294,13 @@ pub async fn handle_ready_to_play_signal(
             if let Some(session_id) = addr_map.get(&player.addr) {
                 if let Some(client_info) = id_map.get(session_id) {
                     debug!(
-                        { fields::ADDR } = %player.addr,
-                        player_status = client_info.player_status,
-                        "Checking player status"
+                        "Checking player status of {}: {}",
+                        player.addr, client_info.player_status
                     );
                     return client_info.player_status == PLAYER_STATUS_NET_SYNC;
                 }
             }
-            debug!(
-                { fields::ADDR } = %player.addr,
-                "Client info not found"
-            );
+            debug!("Client info not found for {}", player.addr);
             false
         });
         all_ready

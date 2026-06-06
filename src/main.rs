@@ -439,6 +439,9 @@ async fn process_packet_in_session(
     global_state: Arc<AppState>,
     packet_counter: &mut u16,
 ) {
+    // This fn runs inside the session span (see handle_session .instrument(span)),
+    // so the current span here is that long-lived session span.
+    let session_span = tracing::Span::current();
     match parse_packet(&data) {
         Ok(messages) => {
             for message in messages.iter() {
@@ -457,7 +460,10 @@ async fn process_packet_in_session(
                     let msg_number = message.message_number;
                     let msg_type = message.message_type;
 
-                    if let Err(e) = handle_message(message, &addr, global_state.clone()).await {
+                    if let Err(e) =
+                        handle_message(message, &addr, global_state.clone(), session_span.clone())
+                            .await
+                    {
                         error!(
                             { fields::MESSAGE_NUMBER } = msg_number,
                             { fields::MESSAGE_TYPE } = format!("0x{:02X}", msg_type),

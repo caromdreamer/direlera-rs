@@ -252,6 +252,9 @@ pub struct ClientInfo {
     pub last_activity_secs: Arc<AtomicU64>,
     /// Packet generator for this client (handles sequence numbers and redundancy)
     pub packet_generator: crate::kaillera::protocol::UDPPacketGenerator,
+    /// The long-lived per-session tracing span. Handlers record session context
+    /// (ping, game_id, ...) onto this so it propagates to every child event.
+    pub session_span: tracing::Span,
 }
 
 impl ClientInfo {

@@ -10,12 +10,7 @@ use crate::simplest_game_sync;
 use crate::*;
 
 // Refactored handle_create_game function
-#[tracing::instrument(skip(message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_create_game(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -24,16 +19,11 @@ pub async fn handle_create_game(
     let start = Instant::now();
     // Check if user is already in a game
     if let Some(client_info) = state.get_client(src).await {
-        util::record_session_fields(&client_info);
         if let Some(existing_game_id) = client_info.game_id {
             // Verify the game actually exists and user is still in it
             if let Some(existing_game) = state.get_game(existing_game_id).await {
                 if existing_game.players.iter().any(|p| p.addr == *src) {
-                    tracing::warn!(
-                        { fields::USER_NAME } = client_info.username_str().as_str(),
-                        { fields::GAME_ID } = existing_game_id,
-                        "User attempted to create game while already in a game"
-                    );
+                    tracing::warn!("User attempted to create game while already in a game");
                     return Ok(()); // Silently ignore invalid request
                 }
             }
@@ -55,9 +45,8 @@ pub async fn handle_create_game(
     // Validate game name length (127 bytes max - not characters, to preserve encoding)
     if game_name.len() > 127 {
         warn!(
-            { fields::USER_NAME } = ?src,
-            game_name_len = game_name.len(),
-            "Game name too long, truncating to 127 bytes"
+            "Game name too long ({} bytes), truncating to 127",
+            game_name.len()
         );
         // Truncate to 127 bytes
         game_name.truncate(127);
@@ -96,15 +85,15 @@ pub async fn handle_create_game(
 
     util::with_client_mut(&state, src, |client_info| {
         client_info.game_id = Some(game_id);
+        // Game membership changed — update the session span.
+        client_info.session_span.record("game_id", game_id);
     })
     .await?;
 
     info!(
-        { fields::GAME_ID } = game_id,
         { fields::GAME_NAME } = util::bytes_for_log(&game_name).as_str(),
-        { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
-        emulator = util::bytes_for_log(&emulator_name).as_str(),
-        "Game created"
+        "Game created (emulator {})",
+        util::bytes_for_log(&emulator_name)
     );
 
     // Build data for new game notification
@@ -134,12 +123,7 @@ pub async fn handle_create_game(
     Ok(())
 }
 
-#[tracing::instrument(skip(message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_join_game(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -160,22 +144,21 @@ pub async fn handle_join_game(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
-    util::record_session_fields(&client);
     let conn_type = client.conn_type;
 
     // Prevent joining if user is already in any game (same or different)
-    if let Some(current_game_id) = client.game_id {
+    if client.game_id.is_some() {
         tracing::warn!(
-            { fields::USER_NAME } = client.username_str().as_str(),
-            { fields::GAME_ID } = game_id,
-            current_game_id = current_game_id,
-            "User attempted to join game while already in a game"
+            "User attempted to join game {} while already in another game",
+            game_id
         );
         return Ok(()); // Silently ignore invalid request
     }
 
     util::with_client_mut(&state, src, |client_info| {
         client_info.game_id = Some(game_id);
+        // Game membership changed — update the session span.
+        client_info.session_span.record("game_id", game_id);
     })
     .await?;
 
@@ -195,10 +178,7 @@ pub async fn handle_join_game(
                 last_interval_secs: None,
             });
         } else {
-            debug!(
-                { fields::GAME_ID } = game_id,
-                "Player already in game, skipping duplicate"
-            );
+            debug!("Player already in game, skipping duplicate");
         }
     })
     .await?;
@@ -211,8 +191,6 @@ pub async fn handle_join_game(
     let status_data = util::make_update_game_status(&game_info)?;
 
     info!(
-        { fields::GAME_ID } = game_id,
-        { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
         { fields::PLAYER_COUNT } = game_info.num_players,
         "Player joined game"
     );
@@ -267,12 +245,7 @@ pub async fn handle_join_game(
 '            NB : Empty String [00]
 '            4B : GameID
  */
-#[tracing::instrument(skip(_message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_quit_game(
     _message: Vec<u8>,
     src: &std::net::SocketAddr,
@@ -281,15 +254,9 @@ pub async fn handle_quit_game(
     let start = Instant::now();
     // Get client info and validate
     let client_info = match state.get_client(src).await {
-        Some(client_info) => {
-            util::record_session_fields(&client_info);
-            client_info
-        }
+        Some(client_info) => client_info,
         None => {
-            error!(
-                { fields::ADDR } = %src,
-                "Client not found during game quit"
-            );
+            error!("Client not found during game quit");
             return Ok(());
         }
     };
@@ -297,10 +264,7 @@ pub async fn handle_quit_game(
     let game_id = match client_info.game_id {
         Some(game_id) => game_id,
         None => {
-            error!(
-                { fields::ADDR } = %src,
-                "Game ID not found during game quit"
-            );
+            error!("Game ID not found during game quit");
             return Ok(());
         }
     };
@@ -309,11 +273,7 @@ pub async fn handle_quit_game(
     let user_id = client_info.user_id;
 
     // If game is in playing state, drop game first for all players
-    info!(
-        { fields::GAME_ID } = game_id,
-        { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
-        "Checking if game is in playing state before quit"
-    );
+    info!("Checking if game is in playing state before quit");
     // Ignore errors from execute_drop_game - it's safe to continue even if drop fails
     let _ = execute_drop_game(game_id, src, &state).await;
 
@@ -322,10 +282,7 @@ pub async fn handle_quit_game(
         let game_arc = match state.get_game_arc(game_id).await {
             Some(arc) => arc,
             None => {
-                error!(
-                    { fields::GAME_ID } = game_id,
-                    "Game not found during game quit"
-                );
+                error!("Game not found during game quit");
                 return Ok(());
             }
         };
@@ -352,18 +309,15 @@ pub async fn handle_quit_game(
     util::with_client_mut(&state, src, |client_info| {
         client_info.game_id = None;
         client_info.player_status = PLAYER_STATUS_IDLE;
+        // Back in the lobby — 0 is the "no game" sentinel (game ids start at 1).
+        client_info.session_span.record("game_id", 0u32);
     })
     .await?;
 
     // Check if quitter is the owner using user_id (to prevent nickname abuse)
     if owner_user_id == user_id {
         // Close the game - Remove game from games list
-        info!(
-            { fields::GAME_ID } = game_id,
-            { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
-            { fields::USER_ID } = user_id,
-            "Owner quit - closing game"
-        );
+        info!("Owner quit - closing game");
 
         state.remove_game(game_id).await;
 
@@ -372,6 +326,7 @@ pub async fn handle_quit_game(
             util::with_client_mut(&state, player_addr, |client_info| {
                 client_info.game_id = None;
                 client_info.player_status = PLAYER_STATUS_IDLE;
+                client_info.session_span.record("game_id", 0u32);
             })
             .await?;
         }
@@ -387,12 +342,7 @@ pub async fn handle_quit_game(
             util::send_packet(&state, player_addr, msg::QUIT_GAME, data.clone()).await?;
         }
     } else {
-        info!(
-            { fields::GAME_ID } = game_id,
-            { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
-            { fields::PLAYER_COUNT } = num_players,
-            "Player quit game"
-        );
+        info!({ fields::PLAYER_COUNT } = num_players, "Player quit game");
 
         // Update game status - build packet directly with necessary values
         let status_data = {
@@ -438,12 +388,7 @@ pub async fn handle_quit_game(
 - **Server**: Sends data accordingly using **Game Data Notify** `[0x12]` or **Game Cache Notify** `[0x13]`
 
  */
-#[tracing::instrument(skip(message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_start_game(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -458,7 +403,6 @@ pub async fn handle_start_game(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
-    util::record_session_fields(&client);
     let requester_username = client.username.clone();
     let requester_user_id = client.user_id;
     let game_id = client
@@ -473,22 +417,12 @@ pub async fn handle_start_game(
 
     // Verify requester is actually in the game's players list
     if !game_info.players.iter().any(|p| p.addr == *src) {
-        warn!(
-            { fields::USER_NAME } = util::bytes_for_log(&requester_username).as_str(),
-            { fields::USER_ID } = requester_user_id,
-            { fields::GAME_ID } = game_id,
-            "User attempted to start game but not in game players list"
-        );
+        warn!("User attempted to start game but not in game players list");
         return Ok(()); // Silently ignore invalid request
     }
 
     if game_info.sync_manager.is_some() {
-        warn!(
-            { fields::USER_NAME } = util::bytes_for_log(&requester_username).as_str(),
-            { fields::USER_ID } = requester_user_id,
-            { fields::GAME_ID } = game_id,
-            "Game not started"
-        );
+        warn!("Start ignored: game already started");
         let chat_message =
             packet_util::build_game_chat_packet(&requester_username, b"Game is already started");
         util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, chat_message).await?;
@@ -496,11 +430,8 @@ pub async fn handle_start_game(
     }
     if game_info.owner_user_id != requester_user_id {
         warn!(
-            { fields::USER_NAME } = util::bytes_for_log(&requester_username).as_str(),
-            { fields::USER_ID } = requester_user_id,
-            { fields::GAME_ID } = game_id,
-            owner_user_id = game_info.owner_user_id,
-            "Non-owner attempted to start game"
+            "Non-owner attempted to start game (owner user_id {})",
+            game_info.owner_user_id
         );
         return Ok(()); // Silently ignore invalid request
     }
@@ -514,10 +445,7 @@ pub async fn handle_start_game(
     // server's assignment, so the sync engine must match that packet cadence.
     let delays: Vec<usize> = players.iter().map(|p| p.conn_type as usize).collect();
 
-    info!(
-        player_delays = ?delays,
-        "Calculated frame delays for game start"
-    );
+    info!("Calculated frame delays for game start: {:?}", delays);
 
     // Initialize SimpleGameSync when game starts
     util::with_game_mut(&state, src, |game_info| {
@@ -537,7 +465,6 @@ pub async fn handle_start_game(
     let game_info = util::fetch_game_info(src, &state).await?;
 
     info!(
-        { fields::GAME_ID } = game_id,
         { fields::PLAYER_COUNT } = game_info.players.len(),
         { fields::GAME_STATUS } = "playing",
         "Game started"
@@ -562,10 +489,8 @@ pub async fn handle_start_game(
         let player_number = (i + 1) as u8;
         let total_players = game_info.players.len() as u8;
         debug!(
-            player_number = player_number,
-            frame_delay = player_delay,
-            { fields::ADDR } = %player.addr,
-            "Sending start game notification"
+            "Sending start game notification to {} (player {}, frame_delay {})",
+            player.addr, player_number, player_delay
         );
         let data =
             packet_util::build_start_game_packet(player_delay as u16, player_number, total_players);
@@ -610,7 +535,6 @@ pub async fn execute_drop_game(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
-    util::record_session_fields(&client);
     let username = client.username.clone();
 
     // Validate game is playing and get dropper info
@@ -644,11 +568,7 @@ pub async fn execute_drop_game(
             .ok_or_else(|| eyre!("Game not found"))?;
         let mut game_info = game_arc.lock().await;
 
-        info!(
-            { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
-            { fields::GAME_ID } = game_id,
-            "Ending game",
-        );
+        info!("Ending game");
 
         // Mark player as dropped and get pending outputs
         let outputs = game_info
@@ -718,15 +638,13 @@ pub async fn execute_drop_game(
         };
 
         info!(
-            { fields::PLAYER_ID } = output.player_id,
-            message_type = msg::message_type_name(message_type),
-            "Sending game data/cache after drop to player"
+            { fields::MESSAGE_TYPE } = msg::message_type_name(message_type),
+            "Sending game data/cache after drop to player {}", output.player_id
         );
         util::send_packet(state, target_addr, message_type, data_to_send).await?;
     }
 
     info!(
-        { fields::GAME_ID } = game_id,
         { fields::PLAYER_COUNT } = players.len(),
         "Game ended, room remains open"
     );
@@ -734,12 +652,7 @@ pub async fn execute_drop_game(
     Ok(true)
 }
 
-#[tracing::instrument(skip(_message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_drop_game(
     _message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -752,7 +665,6 @@ pub async fn handle_drop_game(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Client not found"))?;
-    util::record_session_fields(&client);
     let game_id = client
         .game_id
         .ok_or_else(|| eyre!("Client not in a game"))?;
@@ -767,12 +679,7 @@ pub async fn handle_drop_game(
   - Empty String
   - `2B`: UserID
 */
-#[tracing::instrument(skip(message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-    game_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_kick_user(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -788,8 +695,6 @@ pub async fn handle_kick_user(
         .get_client(src)
         .await
         .ok_or_else(|| eyre!("Requester not found"))?;
-    util::record_session_fields(&requester_info);
-    let requester_username = requester_info.username.clone();
     let requester_user_id = requester_info.user_id;
     let requester_game_id = requester_info
         .game_id
@@ -802,22 +707,14 @@ pub async fn handle_kick_user(
 
     // Verify requester is actually in the game's players list
     if !game_info.players.iter().any(|p| p.addr == *src) {
-        warn!(
-            { fields::USER_NAME } = util::bytes_for_log(&requester_username).as_str(),
-            { fields::USER_ID } = requester_user_id,
-            { fields::GAME_ID } = requester_game_id,
-            "User attempted to kick but not in game players list"
-        );
+        warn!("User attempted to kick but not in game players list");
         return Ok(()); // Silently ignore invalid request
     }
 
     if game_info.owner_user_id != requester_user_id {
         warn!(
-            { fields::USER_NAME } = util::bytes_for_log(&requester_username).as_str(),
-            { fields::USER_ID } = requester_user_id,
-            { fields::GAME_ID } = requester_game_id,
-            owner_user_id = game_info.owner_user_id,
-            "Non-owner attempted to kick user"
+            "Non-owner attempted to kick user (owner user_id {})",
+            game_info.owner_user_id
         );
         return Ok(()); // Silently ignore invalid request
     }
@@ -839,8 +736,8 @@ pub async fn handle_kick_user(
             Some((addr, client_info)) => (client_info.username.clone(), client_info.user_id, *addr),
             None => {
                 error!(
-                    { fields::KICKED_USER_ID } = user_id,
-                    "Client not found during kick user"
+                    "Client not found during kick user (target user_id {})",
+                    user_id
                 );
                 return Ok(());
             }
@@ -855,11 +752,8 @@ pub async fn handle_kick_user(
                 Some(game_id) => {
                     if game_id != requester_game_id {
                         warn!(
-                            { fields::USER_NAME } =
-                                util::bytes_for_log(&requester_username).as_str(),
-                            { fields::GAME_ID } = requester_game_id,
-                            kicked_user_game_id = game_id,
-                            "Attempted to kick user from different game"
+                            "Attempted to kick user from a different game (target game {})",
+                            game_id
                         );
                         return Ok(());
                     }
@@ -867,16 +761,16 @@ pub async fn handle_kick_user(
                 }
                 None => {
                     error!(
-                        { fields::USER_ID } = client_user_id,
-                        "Game ID not found during kick user"
+                        "Game ID not found during kick user (target user_id {})",
+                        client_user_id
                     );
                     return Ok(());
                 }
             },
             None => {
                 error!(
-                    { fields::KICKED_USER_ID } = user_id,
-                    "Client not found during kick user"
+                    "Client not found during kick user (target user_id {})",
+                    user_id
                 );
                 return Ok(());
             }
@@ -887,10 +781,7 @@ pub async fn handle_kick_user(
         let game_arc = match state.get_game_arc(game_id).await {
             Some(arc) => arc,
             None => {
-                error!(
-                    { fields::GAME_ID } = game_id,
-                    "Game not found during kick user"
-                );
+                error!("Game not found during kick user");
                 return Ok(());
             }
         };
@@ -903,10 +794,9 @@ pub async fn handle_kick_user(
     };
 
     info!(
-        { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
-        { fields::USER_ID } = client_user_id,
-        { fields::GAME_ID } = game_id,
-        "User kicked from game"
+        "Kicked user {} (user_id {}) from game",
+        util::bytes_for_log(&username),
+        client_user_id
     );
 
     // Update game status

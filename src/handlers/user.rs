@@ -11,15 +11,12 @@ use super::util;
 use crate::kaillera::message_types as msg;
 use crate::*;
 
-#[tracing::instrument(skip(message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_user_login(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
+    session_span: tracing::Span,
 ) -> color_eyre::Result<()> {
     let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
@@ -31,14 +28,12 @@ pub async fn handle_user_login(
     // 1B: Connection Type
     let conn_type = if !buf.is_empty() { buf.get_u8() } else { 0 };
 
-    tracing::Span::current().record("username", util::bytes_for_log(&username).as_str());
-
     // Validate username length (31 bytes max - not characters, to preserve encoding)
     if username.len() > 31 {
         use tracing::warn;
         warn!(
-            username_len = username.len(),
-            "Username too long, truncating to 31 bytes"
+            "Username too long ({} bytes), truncating to 31",
+            username.len()
         );
         // Truncate to 31 bytes
         username.truncate(31);
@@ -55,9 +50,8 @@ pub async fn handle_user_login(
 
         if is_alive {
             warn!(
-                old_addr = %old_addr,
-                { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
-                "Login rejected: username already in use by active session"
+                "Login rejected: username already in use by active session at {}",
+                old_addr
             );
             return Ok(());
         }
@@ -65,9 +59,8 @@ pub async fn handle_user_login(
         // Stale session — evict and allow reconnect
         if let Some((_, evicted)) = state.remove_client_by_username(&username).await {
             info!(
-                old_addr = %old_addr,
-                { fields::USER_NAME } = util::bytes_for_log(&evicted.username).as_str(),
-                "Evicting stale session for reconnecting user"
+                "Evicting stale session for reconnecting user (old session at {})",
+                old_addr
             );
             let quit_data = packet_util::build_user_quit_packet(
                 &evicted.username,
@@ -80,13 +73,18 @@ pub async fn handle_user_login(
 
     // Lock-free ID generation
     let user_id = state.next_user_id();
+    let session_id = Uuid::new_v4();
+
+    // Stable identity is now known — stamp it on the session span once. Every
+    // subsequent handler log for this session inherits these fields.
+    session_span.record("user_name", util::bytes_for_log(&username).as_str());
+    session_span.record("user_id", user_id);
+    session_span.record("connection_type", conn_type);
+    session_span.record("session_id", session_id.to_string().as_str());
 
     info!(
-        { fields::USER_NAME } = util::bytes_for_log(&username).as_str(),
-        { fields::USER_ID } = user_id,
-        emulator = util::bytes_for_log(&emulator_name).as_str(),
-        { fields::CONNECTION_TYPE } = conn_type,
-        "User logged in"
+        "User logged in (emulator {})",
+        util::bytes_for_log(&emulator_name)
     );
 
     let now_secs = SystemTime::now()
@@ -94,7 +92,7 @@ pub async fn handle_user_login(
         .unwrap_or_default()
         .as_secs();
     let client = ClientInfo {
-        session_id: Uuid::new_v4(),
+        session_id,
         username,
         emulator_name,
         conn_type,
@@ -107,6 +105,7 @@ pub async fn handle_user_login(
         ping_samples: Vec::new(),
         last_activity_secs: Arc::new(std::sync::atomic::AtomicU64::new(now_secs)),
         packet_generator: kaillera::protocol::UDPPacketGenerator::new(),
+        session_span,
     };
 
     // Encapsulated method
@@ -127,11 +126,7 @@ pub async fn handle_user_login(
 '            2B : UserID
 '            NB : Message
  */
-#[tracing::instrument(skip(message, state), fields(
-    addr = %src,
-    username = tracing::field::Empty,
-    session_id = tracing::field::Empty,
-))]
+#[tracing::instrument(skip_all)]
 pub async fn handle_user_quit(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
@@ -148,10 +143,6 @@ pub async fn handle_user_quit(
     // NB: Message (read as bytes to preserve encoding)
     let user_message = util::read_string_bytes(&mut buf);
 
-    if let Some(client) = state.get_client(src).await {
-        util::record_session_fields(&client);
-    }
-
     // Handle quit game first
     super::game::handle_quit_game(vec![0x00, 0xFF, 0xFF], src, state.clone()).await?;
 
@@ -166,8 +157,8 @@ pub async fn handle_user_quit(
         util::broadcast_packet(&state, msg::USER_QUIT, data).await?;
     } else {
         debug!(
-            quit_message = String::from_utf8_lossy(&user_message).as_ref(),
-            "Unknown client quit"
+            "Unknown client quit: {}",
+            String::from_utf8_lossy(&user_message)
         );
     }
     util::record_processing_time("user_quit", start.elapsed());

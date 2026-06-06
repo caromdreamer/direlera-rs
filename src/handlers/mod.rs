@@ -10,21 +10,21 @@ use tracing::{debug, instrument, warn};
 use crate::kaillera::message_types as msg;
 use crate::*;
 
-// You can use #[instrument(skip(state))] to prevent selected arguments (like 'state') from being included in the default tracing output.
-// This helps avoid logging large or sensitive data, or types that do not implement Debug.
-// For tracing, all arguments except those listed in skip() will be captured.
-// Always use English comments.
-// Only skip 'state' and 'message' in tracing, do not skip 'src' so that 'src' appears in tracing logs.
-#[instrument(level = "debug", skip(state, message))]
+// Handlers run as named child spans of the long-lived session span; the session
+// span already carries addr/identity/ping/game_id, so we skip_all here to avoid
+// re-stamping those fields. `session_span` is the session span, forwarded to
+// login so it can record identity once and stash the handle in ClientInfo.
+#[instrument(level = "debug", skip_all)]
 pub async fn handle_message(
     message: kaillera::protocol::ParsedMessage,
     src: &std::net::SocketAddr,
     state: Arc<AppState>,
+    session_span: tracing::Span,
 ) -> color_eyre::Result<()> {
     metrics::counter!("packets_received_total", "type" => crate::kaillera::message_types::message_type_name(message.message_type)).increment(1);
     match message.message_type {
         msg::USER_QUIT => user::handle_user_quit(message, src, state).await?,
-        msg::USER_LOGIN => user::handle_user_login(message, src, state).await?,
+        msg::USER_LOGIN => user::handle_user_login(message, src, state, session_span).await?,
         msg::CLIENT_TO_SERVER_ACK => handle_client_to_server_ack(src, state).await?,
         msg::GLOBAL_CHAT => chat::handle_global_chat(message, src, state).await?,
         msg::GAME_CHAT => chat::handle_game_chat(message, src, state).await?,
@@ -88,6 +88,8 @@ pub async fn handle_client_to_server_ack(
                     }
                 }
             }
+            // ping is measured here (not at login), so refresh it on the session span.
+            client_info.session_span.record("ping", client_info.ping);
             // Note: last_ping_time will be updated when we send SERVER_TO_CLIENT_ACK below
             Ok(client_info.ack_count)
         })

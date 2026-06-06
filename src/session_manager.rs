@@ -244,7 +244,19 @@ async fn handle_session(
     sessions: Arc<RwLock<HashMap<SocketAddr, UdpSession>>>,
     global_state: Arc<AppState>,
 ) {
-    let span = tracing::info_span!("session", addr = %addr);
+    // Long-lived per-session span. Identity/ping/game_id are recorded onto it as
+    // they become known or change (login, ACK, join/quit), and every child
+    // handler span inherits them — so handlers no longer re-stamp these fields.
+    let span = tracing::info_span!(
+        "session",
+        addr = %addr,
+        user_name = tracing::field::Empty,
+        user_id = tracing::field::Empty,
+        connection_type = tracing::field::Empty,
+        ping = tracing::field::Empty,
+        session_id = tracing::field::Empty,
+        game_id = tracing::field::Empty,
+    );
     async move {
         info!("Session handler started");
 
