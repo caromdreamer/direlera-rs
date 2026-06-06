@@ -219,7 +219,10 @@ fn load_config() -> Config {
             }
         },
         Err(_) => {
-            eprintln!("config.toml not found, using default configuration");
+            eprintln!("config.toml not found.");
+            eprintln!("Copy config.toml.example to config.toml to customize:");
+            eprintln!("  cp config.toml.example config.toml");
+            eprintln!("Using default configuration for now.");
             Config::default()
         }
     }

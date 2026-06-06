@@ -215,6 +215,7 @@ dependencies = [
  "encoding_rs",
  "metrics",
  "metrics-exporter-prometheus",
+ "nu-ansi-term",
  "reqwest",
  "serde",
  "tokio",

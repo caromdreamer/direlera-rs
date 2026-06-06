@@ -1,0 +1,38 @@
+main_port = 8080
+control_port = 27888
+
+# Welcome message shown to clients when they connect.
+# Each line is sent as a separate message, so you can use multiple lines.
+welcome_message = """
+Welcome to the Kaillera server!
+Have fun and play fair.
+"""
+
+[master_list]
+# Set enabled = true to announce this server on public master lists.
+enabled = false
+server_name = "My Kaillera Server"
+server_location = "US"
+server_website = "https://example.com"
+max_users = 100
+max_games = 50
+
+[[master_list.servers]]
+preset = "kaillera"          # http://www.kaillera.com/touch_server.php
+
+[[master_list.servers]]
+preset = "emulinker"         # http://kaillerareborn.2manygames.fr/touch_list.php
+#
+# # Custom / private master server:
+# [[master_list.servers]]
+# url = "http://my-private-master.example.com/touch.php"
+# protocol = "kaillera"        # or "emulinker"
+
+# Tracing configuration
+# Format options: "pretty", "compact", "json"
+# - pretty: human-readable multi-line format (best for development)
+# - compact: single-line format (default)
+# - json: structured JSON format (best for production/log aggregation)
+[tracing]
+format = "pretty"
+level = "info"     # Options: "trace", "debug", "info", "warn", "error"

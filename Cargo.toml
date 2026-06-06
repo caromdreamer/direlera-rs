@@ -16,6 +16,9 @@ tracing-subscriber = { version = "0.3", features = [
     "fmt",
 ] }
 tracing-bunyan-formatter = "0.3"
+# Already pulled in transitively by tracing-subscriber; declared directly so we
+# can enable Windows virtual-terminal (ANSI) processing at startup.
+nu-ansi-term = "0.50"
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
 color-eyre = "0.6.5"

@@ -1,24 +1,49 @@
 // Logger configuration and setup
+use std::io::IsTerminal;
 use std::str::FromStr;
 use tracing_bunyan_formatter::{BunyanFormattingLayer, JsonStorageLayer};
 use tracing_subscriber::{layer::SubscriberExt, EnvFilter, Registry};
+
+/// Decide whether to emit ANSI color/style escape codes.
+///
+/// On Windows, legacy consoles don't interpret ANSI escapes and render them as
+/// garbage (e.g. `←[2m`), which is what made the `pretty` format look broken.
+/// We only enable ANSI when stdout is an interactive terminal, and on Windows
+/// we additionally try to turn on virtual-terminal processing — if that fails
+/// (old conhost), we fall back to plain, escape-free output.
+fn ansi_enabled() -> bool {
+    if !std::io::stdout().is_terminal() {
+        return false;
+    }
+    #[cfg(windows)]
+    {
+        nu_ansi_term::enable_ansi_support().is_ok()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
 
 /// Initialize logger with different formats
 pub fn init_logger(format: LogFormat, level: LogLevel) {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level.as_str()));
+    let ansi = ansi_enabled();
 
     match format {
         LogFormat::Compact => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_target(false)
+                .with_ansi(ansi)
                 .init();
         }
         LogFormat::Pretty => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter)
                 .with_target(false)
+                .with_ansi(ansi)
                 .pretty()
                 .init();
         }
