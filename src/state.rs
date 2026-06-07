@@ -242,12 +242,12 @@ pub struct ClientInfo {
     pub emulator_name: Vec<u8>, // Store as bytes to preserve original encoding
     pub conn_type: u8,
     pub user_id: u16,
-    pub ping: u32, // Average ping value (average of last 5 measurements, excluding first)
+    pub ping: u32, // Login-time ping (ms): mean RTT over the ACK handshake round trips
     pub player_status: PlayerStatus,
     pub game_id: Option<u32>,
     pub last_ping_time: Option<Instant>, // Timestamp when SERVER_TO_CLIENT_ACK was sent (for RTT measurement)
     pub ack_count: u16,
-    pub ping_samples: Vec<u32>, // Recent RTT measurements for averaging (max 5, excluding first measurement)
+    pub ping_total: std::time::Duration, // Accumulated RTT across handshake round trips; divided once at the end (full precision, no per-sample ms truncation)
     /// Unix timestamp (seconds) of the last received packet — updated lock-free
     pub last_activity_secs: Arc<AtomicU64>,
     /// Packet generator for this client (handles sequence numbers and redundancy)

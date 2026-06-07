@@ -102,7 +102,7 @@ pub async fn handle_user_login(
         game_id: None,
         last_ping_time: Some(Instant::now()),
         ack_count: 0,
-        ping_samples: Vec::new(),
+        ping_total: std::time::Duration::ZERO,
         last_activity_secs: Arc::new(std::sync::atomic::AtomicU64::new(now_secs)),
         packet_generator: kaillera::protocol::UDPPacketGenerator::new(),
         session_span,

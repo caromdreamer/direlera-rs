@@ -10,6 +10,12 @@ use tracing::{debug, instrument, warn};
 use crate::kaillera::message_types as msg;
 use crate::*;
 
+// Number of ACK round trips used to estimate login ping. The server keeps
+// replying with SERVER_TO_CLIENT_ACK until this many round trips have completed,
+// then averages them (the handshake is finalized on the round trip *after* this
+// count, i.e. the 4th).
+const NUM_ACKS_FOR_SPEED_TEST: u16 = 3;
+
 // Handlers run as named child spans of the long-lived session span; the session
 // span already carries addr/identity/ping/game_id, so we skip_all here to avoid
 // re-stamping those fields. `session_span` is the session span, forwarded to
@@ -60,33 +66,20 @@ pub async fn handle_client_to_server_ack(
     state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
     // Client to Server ACK [0x06]
-    // Calculate ping (RTT: time from sending SERVER_TO_CLIENT_ACK to receiving CLIENT_TO_SERVER_ACK)
-    // Average of last 5 measurements, excluding the first measurement
-    // and update ack count
+    // Login ping: RTT from sending SERVER_TO_CLIENT_ACK to receiving CLIENT_TO_SERVER_ACK,
+    // averaged over the handshake round trips. Each RTT is accumulated at full
+    // precision and divided once at the end, rather than truncating every sample
+    // to whole milliseconds.
     let ack_count = state
         .update_client(src, |client_info| {
             if let Some(last_ping_time) = client_info.last_ping_time {
-                // Calculate round-trip time (RTT) from when we sent SERVER_TO_CLIENT_ACK
-                let current_rtt = last_ping_time.elapsed().as_millis() as u32;
-
+                client_info.ping_total += last_ping_time.elapsed();
                 client_info.ack_count += 1;
-
-                // Skip first measurement (ack_count == 1)
-                if client_info.ack_count > 1 {
-                    // Add current RTT to samples
-                    client_info.ping_samples.push(current_rtt);
-
-                    // Keep only last 5 measurements
-                    if client_info.ping_samples.len() > 5 {
-                        client_info.ping_samples.remove(0);
-                    }
-
-                    // Calculate average of collected samples
-                    if !client_info.ping_samples.is_empty() {
-                        let sum: u32 = client_info.ping_samples.iter().sum();
-                        client_info.ping = sum / client_info.ping_samples.len() as u32;
-                    }
-                }
+                // Mean RTT so far (includes the first round trip); recomputed each
+                // ACK so it's final the instant the handshake completes. Round to
+                // nearest ms.
+                let avg = client_info.ping_total / client_info.ack_count as u32;
+                client_info.ping = (avg.as_secs_f64() * 1000.0).round() as u32;
             }
             // ping is measured here (not at login), so refresh it on the session span.
             client_info.session_span.record("ping", client_info.ping);
@@ -95,7 +88,7 @@ pub async fn handle_client_to_server_ack(
         })
         .await?;
 
-    if ack_count >= 3 {
+    if ack_count > NUM_ACKS_FOR_SPEED_TEST {
         let data = util::make_server_status(src, &state).await?;
         util::send_packet(&state, src, msg::SERVER_STATUS, data).await?;
 
@@ -123,9 +116,9 @@ pub async fn handle_client_keep_alive(
     _src: &std::net::SocketAddr,
     _state: Arc<AppState>,
 ) -> color_eyre::Result<()> {
-    // Matching EmuLinker-K (KeepAliveAction): keep-alive only refreshes the
-    // client's activity timestamp, which already happens in the session loop
-    // (update_client_activity). The server sends NO response.
+    // Keep-alive only refreshes the client's activity timestamp, which already
+    // happens in the session loop (update_client_activity). The server sends NO
+    // response.
     //
     // Previously this re-sent SERVER_STATUS (the full user+game list) on every
     // keep-alive. Clients append received list entries, so the periodic re-send
