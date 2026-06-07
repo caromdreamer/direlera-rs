@@ -1,6 +1,12 @@
 main_port = 8080
 control_port = 27888
 
+# Always send full game data downstream instead of a GameCache index reference.
+# Costs bandwidth but removes any dependence on clients mirroring the server's
+# output cache correctly (higher compatibility across client implementations).
+# Latency is unaffected (same packet cadence, larger payload).
+disable_output_cache = false
+
 # Welcome message shown to clients when they connect.
 # Each line is sent as a separate message, so you can use multiple lines.
 welcome_message = """
@@ -46,6 +52,9 @@ logs_push_password = ""
 # Set enabled = true to announce this server on public master lists.
 enabled = false
 server_name = "My Kaillera Server"
+# Public IP or hostname that clients use to connect (announced to master lists).
+# Auto-discovered by default; uncomment only to override.
+#server_address = "your.server.example.com"
 server_location = "US"
 server_website = "https://example.com"
 max_users = 100

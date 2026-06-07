@@ -453,10 +453,15 @@ pub async fn handle_start_game(
 
     info!("Calculated frame delays for game start: {:?}", delays);
 
+    let disable_output_cache = state.config.disable_output_cache;
+
     // Initialize SimpleGameSync when game starts
     util::with_game_mut(&state, src, |game_info| {
         game_info.game_status = GAME_STATUS_PLAYING;
-        game_info.sync_manager = Some(simplest_game_sync::CachedGameSync::new(delays.clone()));
+        game_info.sync_manager = Some(
+            simplest_game_sync::CachedGameSync::new(delays.clone())
+                .with_output_cache_disabled(disable_output_cache),
+        );
     })
     .await?;
 

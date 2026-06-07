@@ -61,6 +61,13 @@ pub struct Config {
     pub metrics_push_username: String,
     #[serde(default)]
     pub metrics_push_password: String,
+    /// When true, the server never sends a GameCache index downstream and always
+    /// transmits the full combined game data. This removes any dependence on a
+    /// client correctly mirroring the server's output cache — trading bandwidth
+    /// for compatibility across diverse client implementations. Latency is
+    /// unaffected (same packet cadence, larger payload). Default false.
+    #[serde(default)]
+    pub disable_output_cache: bool,
     /// When true, push logs to a Loki endpoint (in addition to stdout). Designed,
     /// like metrics push, for servers a central collector cannot reach to scrape.
     #[serde(default)]
@@ -92,6 +99,7 @@ impl Default for Config {
             metrics_push_interval_secs: default_metrics_push_interval(),
             metrics_push_username: String::new(),
             metrics_push_password: String::new(),
+            disable_output_cache: false,
             logs_push_enabled: false,
             logs_push_url: String::new(),
             logs_push_username: String::new(),
@@ -351,10 +359,21 @@ async fn main() -> color_eyre::Result<()> {
     let interval_buckets = &[
         0.004, 0.008, 0.012, 0.016, 0.02, 0.025, 0.033, 0.04, 0.05, 0.066, 0.1, 0.2, 0.5,
     ];
-    // Push mode requires a destination URL; warn and fall back to off if missing.
-    let push_ok = config.metrics_push_enabled && !config.metrics_push_url.is_empty();
+    // Push mode requires a destination URL and a non-empty server_id (the latter
+    // becomes the grouping label; pushing without it would flood the central
+    // gateway with anonymous, colliding series). Warn and fall back to off if
+    // either is missing.
+    let push_ok = config.metrics_push_enabled
+        && !config.metrics_push_url.is_empty()
+        && !config.server_id.is_empty();
     if config.metrics_push_enabled && config.metrics_push_url.is_empty() {
         warn!("metrics_push_enabled = true but metrics_push_url is empty — metrics push disabled");
+    }
+    if config.metrics_push_enabled
+        && !config.metrics_push_url.is_empty()
+        && config.server_id.is_empty()
+    {
+        warn!("metrics_push_enabled = true but server_id is empty — metrics push disabled (set a unique server_id in config.toml)");
     }
 
     if push_ok || config.metrics_enabled {
@@ -385,15 +404,8 @@ async fn main() -> color_eyre::Result<()> {
         // Push and scrape-listener are mutually exclusive in the exporter; push
         // wins when enabled (the unified path for NAT/firewalled servers).
         if push_ok {
-            let server_id = if config.server_id.is_empty() {
-                warn!(
-                    "server_id is empty; pushing metrics as 'unknown'. \
-                     Set a unique server_id in config.toml."
-                );
-                "unknown".to_string()
-            } else {
-                config.server_id.clone()
-            };
+            // push_ok guarantees server_id is non-empty (checked above).
+            let server_id = config.server_id.clone();
             // Build the full Pushgateway grouping path: server_id becomes a label
             // and must be unique per server, else gateways overwrite each other's
             // group. We push via reqwest (already a dependency, ring-backed) rather

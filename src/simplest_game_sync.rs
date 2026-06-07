@@ -403,6 +403,11 @@ pub struct CachedGameSync {
     input_caches: Vec<InputCache>,
     /// Per-player output caches (server-side cache)
     output_caches: Vec<InputCache>,
+    /// When true, server→client outputs are always sent as full GameData and
+    /// never as a GameCache index. Trades bandwidth for compatibility with
+    /// diverse client cache implementations; latency is unaffected. In this mode
+    /// the output cache is bypassed entirely (never queried or filled).
+    disable_output_cache: bool,
 }
 
 impl CachedGameSync {
@@ -413,7 +418,15 @@ impl CachedGameSync {
             sync: SimplestGameSync::new(player_delays.clone()),
             input_caches: (0..player_count).map(|_| InputCache::new()).collect(),
             output_caches: (0..player_count).map(|_| InputCache::new()).collect(),
+            disable_output_cache: false,
         }
+    }
+
+    /// Force full-GameData downstream (never emit a GameCache index). See the
+    /// `disable_output_cache` config option.
+    pub fn with_output_cache_disabled(mut self, disabled: bool) -> Self {
+        self.disable_output_cache = disabled;
+        self
     }
 
     /// Process client input with cache support.
@@ -458,7 +471,10 @@ impl CachedGameSync {
         let mut cache_overflowed = false;
         let mut milestone: Option<usize> = None;
         for raw_output in raw_outputs {
-            let cached_output = if let Some(cache_pos) =
+            let cached_output = if self.disable_output_cache {
+                // Compatibility mode: always send full data, bypass the cache.
+                ServerResponse::GameData(raw_output.output)
+            } else if let Some(cache_pos) =
                 self.output_caches[raw_output.player_id].find(&raw_output.output)
             {
                 // Found in cache - use cache reference
@@ -509,7 +525,10 @@ impl CachedGameSync {
         // Convert outputs to cached responses
         let mut results = Vec::new();
         for raw_output in raw_outputs {
-            let cached_output = if let Some(cache_pos) =
+            let cached_output = if self.disable_output_cache {
+                // Compatibility mode: always send full data, bypass the cache.
+                ServerResponse::GameData(raw_output.output)
+            } else if let Some(cache_pos) =
                 self.output_caches[raw_output.player_id].find(&raw_output.output)
             {
                 // Found in cache - use cache reference
@@ -726,6 +745,40 @@ mod tests {
             .iter()
             .any(|o| matches!(o.response, ServerResponse::GameCache(_)));
         assert!(has_cache);
+    }
+
+    #[test]
+    fn test_output_cache_disabled_always_game_data() {
+        // Same scenario as test_cache_mechanism, but with output caching disabled:
+        // the repeated frame must still be sent as full GameData, never a
+        // GameCache index reference.
+        let mut manager = CachedGameSync::new(vec![1, 1]).with_output_cache_disabled(true);
+
+        manager
+            .process_client_input(0, ClientInput::GameData(vec![0x00, 0x00]))
+            .unwrap();
+        let outputs = manager
+            .process_client_input(1, ClientInput::GameData(vec![0x00, 0x00]))
+            .unwrap();
+        assert!(outputs
+            .0
+            .iter()
+            .all(|o| matches!(o.response, ServerResponse::GameData(_))));
+
+        // Repeat the identical frame — would normally resolve to a GameCache hit.
+        manager
+            .process_client_input(0, ClientInput::GameData(vec![0x00, 0x00]))
+            .unwrap();
+        let outputs = manager
+            .process_client_input(1, ClientInput::GameData(vec![0x00, 0x00]))
+            .unwrap();
+        assert!(
+            outputs
+                .0
+                .iter()
+                .all(|o| matches!(o.response, ServerResponse::GameData(_))),
+            "output cache disabled must never emit GameCache"
+        );
     }
 
     #[test]
