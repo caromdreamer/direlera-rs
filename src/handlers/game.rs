@@ -254,26 +254,29 @@ pub async fn handle_join_game(
 '            4B : GameID
  */
 /// If the current owner is no longer an active room member (left the room), hand
-/// ownership to the first remaining in-room player. No client packet is needed:
-/// clients don't track ownership; the server enforces owner-gated actions
-/// (start/kick) via `owner_user_id`. No-op when the owner is still present or the
+/// ownership to the first remaining in-room player. The server enforces owner-gated
+/// actions (start/kick) via `owner_user_id`, so no migration packet is required;
+/// returns the new owner's username when ownership changed so the caller can
+/// announce it in the room. No-op (None) when the owner is still present or the
 /// room is empty.
-fn migrate_owner_if_needed(game_info: &mut GameInfo) {
+fn migrate_owner_if_needed(game_info: &mut GameInfo) -> Option<Vec<u8>> {
     let owner_present = game_info
         .players
         .iter()
         .any(|p| !p.left_room && p.user_id == game_info.owner_user_id);
     if owner_present {
-        return;
+        return None;
     }
-    if let Some(p) = game_info.players.iter().find(|p| !p.left_room) {
-        info!(
-            "Owner left - migrating ownership to {}",
-            util::bytes_for_log(&p.username)
-        );
-        game_info.owner = p.username.clone();
-        game_info.owner_user_id = p.user_id;
-    }
+    let p = game_info.players.iter().find(|p| !p.left_room)?;
+    let new_owner = p.username.clone();
+    let new_owner_id = p.user_id;
+    info!(
+        "Owner left - migrating ownership to {}",
+        util::bytes_for_log(&new_owner)
+    );
+    game_info.owner = new_owner.clone();
+    game_info.owner_user_id = new_owner_id;
+    Some(new_owner)
 }
 
 #[tracing::instrument(skip_all)]
@@ -333,7 +336,8 @@ pub async fn handle_quit_game(
         WaitingOpen,   // removed; room stays with remaining players
         WaitingClosed, // removed; room now empty
     }
-    let outcome = {
+    // `new_owner` carries the new host's username if ownership migrated (to announce).
+    let (outcome, new_owner) = {
         let mut game_info = game_arc.lock().await;
         let idx = game_info.players.iter().position(|p| p.addr == *src);
         if game_info.sync_manager.is_some() {
@@ -342,20 +346,21 @@ pub async fn handle_quit_game(
                 game_info.players[i].left_room = true;
             }
             game_info.num_players = game_info.players.iter().filter(|p| !p.left_room).count() as u8;
-            migrate_owner_if_needed(&mut game_info);
-            QuitOutcome::Playing
+            let migrated = migrate_owner_if_needed(&mut game_info);
+            (QuitOutcome::Playing, migrated)
         } else {
             // No live sync → safe to remove from the Vec immediately.
             if let Some(i) = idx {
                 game_info.players.remove(i);
             }
             game_info.num_players = game_info.players.len() as u8;
-            migrate_owner_if_needed(&mut game_info);
-            if game_info.players.is_empty() {
+            let migrated = migrate_owner_if_needed(&mut game_info);
+            let outcome = if game_info.players.is_empty() {
                 QuitOutcome::WaitingClosed
             } else {
                 QuitOutcome::WaitingOpen
-            }
+            };
+            (outcome, migrated)
         }
     };
 
@@ -393,6 +398,16 @@ pub async fn handle_quit_game(
                 let status_data = util::make_update_game_status(&game_info)?;
                 util::broadcast_packet(&state, msg::UPDATE_GAME_STATUS, status_data).await?;
             }
+        }
+    }
+
+    // Announce the new host in the room (if ownership migrated and the room still
+    // exists). Kaillera has no owner-change packet, so use a server game-chat line.
+    if let Some(owner_name) = new_owner {
+        if state.get_game(game_id).await.is_some() {
+            let text = format!("{} is now the room host", util::bytes_for_log(&owner_name));
+            let chat = packet_util::build_game_chat_packet(b"Server", text.as_bytes());
+            util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, chat).await?;
         }
     }
 
