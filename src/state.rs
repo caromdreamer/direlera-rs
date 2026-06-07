@@ -305,8 +305,9 @@ pub const GAME_STATUS_PLAYING: u8 = 1;
 #[allow(dead_code)]
 pub const GAME_STATUS_NET_SYNC: u8 = 2;
 
-/// Player information stored in GameInfo (immutable after joining)
-/// These fields don't change once a player joins the game
+/// Player information stored in GameInfo.
+/// The Vec position of a player is also its lockstep sync-slot index, which must
+/// not move while a game is live — see `left_room`.
 #[derive(Debug, Clone)]
 pub struct GamePlayerInfo {
     pub addr: std::net::SocketAddr,
@@ -319,6 +320,10 @@ pub struct GamePlayerInfo {
     /// pace per game (fps / conn_type / batching independent) so we can report the
     /// current/baseline ratio as a smoothness signal.
     pub interval_baseline_secs: Option<f64>,
+    /// True once the player left the room (QUIT / reap) while a game was still
+    /// live. The Vec index is the sync slot and can't move mid-game, so we
+    /// tombstone instead of removing; the entry is purged when the game ends.
+    pub left_room: bool,
 }
 
 impl GamePlayerInfo {

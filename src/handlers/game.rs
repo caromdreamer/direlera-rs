@@ -1,4 +1,4 @@
-use bytes::{Buf, BufMut, BytesMut};
+use bytes::{Buf, BytesMut};
 use color_eyre::eyre::eyre;
 use std::sync::Arc;
 use std::time::Instant;
@@ -77,6 +77,7 @@ pub async fn handle_create_game(
             conn_type,
             last_game_data_recv: None,
             interval_baseline_secs: None,
+            left_room: false,
         }],
         metric_labels: Arc::new(GameMetricLabels {
             // Observability-only UUID; the wire game_id sent to clients is unchanged.
@@ -182,6 +183,7 @@ pub async fn handle_join_game(
                 conn_type,
                 last_game_data_recv: None,
                 interval_baseline_secs: None,
+                left_room: false,
             });
         } else {
             debug!("Player already in game, skipping duplicate");
@@ -251,6 +253,29 @@ pub async fn handle_join_game(
 '            NB : Empty String [00]
 '            4B : GameID
  */
+/// If the current owner is no longer an active room member (left the room), hand
+/// ownership to the first remaining in-room player. No client packet is needed:
+/// clients don't track ownership; the server enforces owner-gated actions
+/// (start/kick) via `owner_user_id`. No-op when the owner is still present or the
+/// room is empty.
+fn migrate_owner_if_needed(game_info: &mut GameInfo) {
+    let owner_present = game_info
+        .players
+        .iter()
+        .any(|p| !p.left_room && p.user_id == game_info.owner_user_id);
+    if owner_present {
+        return;
+    }
+    if let Some(p) = game_info.players.iter().find(|p| !p.left_room) {
+        info!(
+            "Owner left - migrating ownership to {}",
+            util::bytes_for_log(&p.username)
+        );
+        game_info.owner = p.username.clone();
+        game_info.owner_user_id = p.user_id;
+    }
+}
+
 #[tracing::instrument(skip_all)]
 pub async fn handle_quit_game(
     _message: Vec<u8>,
@@ -281,40 +306,15 @@ pub async fn handle_quit_game(
     let username = client_info.username.clone();
     let user_id = client_info.user_id;
 
-    // If game is in playing state, drop game first for all players
-    info!("Checking if game is in playing state before quit");
-    // Ignore errors from execute_drop_game - it's safe to continue even if drop fails
-    let _ = execute_drop_game(game_id, src, &state).await;
-
-    // Extract necessary information and remove player from game
-    let (owner_user_id, player_addrs, game_status, max_players, num_players) = {
-        let game_arc = match state.get_game_arc(game_id).await {
-            Some(arc) => arc,
-            None => {
-                error!("Game not found during game quit");
-                return Ok(());
-            }
-        };
-        let mut game_info = game_arc.lock().await;
-        let owner_user_id = game_info.owner_user_id;
-        let player_addrs: Vec<_> = game_info.players.iter().map(|p| p.addr).collect();
-        let game_status = game_info.game_status;
-        let max_players = game_info.max_players;
-        if let Some(idx) = game_info.players.iter().position(|p| p.addr == *src) {
-            game_info.players.remove(idx);
-            game_info.num_players -= 1;
+    let game_arc = match state.get_game_arc(game_id).await {
+        Some(arc) => arc,
+        None => {
+            debug!("Quit game ignored: game already gone (post-teardown race)");
+            return Ok(());
         }
-        let num_players = game_info.num_players;
-        (
-            owner_user_id,
-            player_addrs,
-            game_status,
-            max_players,
-            num_players,
-        )
     };
 
-    // Remove client from game
+    // Return this client to the lobby regardless of game state.
     util::with_client_mut(&state, src, |client_info| {
         client_info.game_id = None;
         client_info.player_status = PLAYER_STATUS_IDLE;
@@ -323,53 +323,79 @@ pub async fn handle_quit_game(
     })
     .await?;
 
-    // Check if quitter is the owner using user_id (to prevent nickname abuse)
-    if owner_user_id == user_id {
-        // Close the game - Remove game from games list
-        info!("Owner quit - closing game");
-
-        state.remove_game(game_id).await;
-
-        // Update remaining players' status
-        for player_addr in &player_addrs {
-            util::with_client_mut(&state, player_addr, |client_info| {
-                client_info.game_id = None;
-                client_info.player_status = PLAYER_STATUS_IDLE;
-                client_info.session_span.record("game_id", 0u32);
-            })
-            .await?;
-        }
-
-        // Make close game notification
-        let data = packet_util::build_close_game_packet(game_id);
-        util::broadcast_packet(&state, msg::CLOSE_GAME, data).await?;
-
-        // Quit game notification - send directly to stored player addresses
-        // (can't use broadcast_packet_to_game since game was already removed)
-        let data = packet_util::build_quit_game_packet(&username, user_id);
-        for player_addr in &player_addrs {
-            util::send_packet(&state, player_addr, msg::QUIT_GAME, data.clone()).await?;
-        }
-    } else {
-        info!({ fields::PLAYER_COUNT } = num_players, "Player quit game");
-
-        // Update game status - build packet directly with necessary values
-        let status_data = {
-            use crate::packet_util;
-            let mut data = BytesMut::new();
-            packet_util::put_empty_string(&mut data);
-            data.put_u32_le(game_id);
-            data.put_u8(game_status);
-            data.put_u8(num_players);
-            data.put_u8(max_players);
-            data.to_vec()
-        };
-        util::broadcast_packet(&state, msg::UPDATE_GAME_STATUS, status_data).await?;
-
-        // Quit game notification
-        let data = packet_util::build_quit_game_packet(&username, user_id);
-        util::broadcast_packet_to_game(&state, game_id, msg::QUIT_GAME, data).await?;
+    // Decide and mutate under a single lock so the "is it playing?" check and the
+    // Vec mutation can't race a concurrent game-end. The players Vec doubles as the
+    // lockstep sync-slot index space, so it must not be reindexed while a game is
+    // live (removing a middle player shifts later players' position() and routes
+    // their input to the wrong/dropped slot, freezing the game).
+    enum QuitOutcome {
+        Playing,       // tombstoned; drop in sync, compaction deferred to game end
+        WaitingOpen,   // removed; room stays with remaining players
+        WaitingClosed, // removed; room now empty
     }
+    let outcome = {
+        let mut game_info = game_arc.lock().await;
+        let idx = game_info.players.iter().position(|p| p.addr == *src);
+        if game_info.sync_manager.is_some() {
+            // Live game: tombstone the slot (keep it), don't remove.
+            if let Some(i) = idx {
+                game_info.players[i].left_room = true;
+            }
+            game_info.num_players = game_info.players.iter().filter(|p| !p.left_room).count() as u8;
+            migrate_owner_if_needed(&mut game_info);
+            QuitOutcome::Playing
+        } else {
+            // No live sync → safe to remove from the Vec immediately.
+            if let Some(i) = idx {
+                game_info.players.remove(i);
+            }
+            game_info.num_players = game_info.players.len() as u8;
+            migrate_owner_if_needed(&mut game_info);
+            if game_info.players.is_empty() {
+                QuitOutcome::WaitingClosed
+            } else {
+                QuitOutcome::WaitingOpen
+            }
+        }
+    };
+
+    let quit_data = packet_util::build_quit_game_packet(&username, user_id);
+
+    match outcome {
+        QuitOutcome::Playing => {
+            // Drop in the sync engine: keeps the slot (zero-filled) so the remaining
+            // players keep advancing, and ends/compacts the game if this was the
+            // last active player.
+            info!("Player quit during play - dropping slot, keeping game alive");
+            let _ = execute_drop_game(game_id, src, &state).await;
+
+            // execute_drop_game may have closed the room (if everyone had left),
+            // sending CLOSE_GAME itself.
+            if let Some(game_info) = state.get_game(game_id).await {
+                util::broadcast_packet_to_game(&state, game_id, msg::QUIT_GAME, quit_data).await?;
+                let status_data = util::make_update_game_status(&game_info)?;
+                util::broadcast_packet(&state, msg::UPDATE_GAME_STATUS, status_data).await?;
+            } else {
+                util::broadcast_packet(&state, msg::QUIT_GAME, quit_data).await?;
+            }
+        }
+        QuitOutcome::WaitingClosed => {
+            info!("Last player left waiting room - closing game");
+            state.remove_game(game_id).await;
+            let close = packet_util::build_close_game_packet(game_id);
+            util::broadcast_packet(&state, msg::CLOSE_GAME, close).await?;
+            util::broadcast_packet(&state, msg::QUIT_GAME, quit_data).await?;
+        }
+        QuitOutcome::WaitingOpen => {
+            info!("Player quit waiting room");
+            util::broadcast_packet_to_game(&state, game_id, msg::QUIT_GAME, quit_data).await?;
+            if let Some(game_info) = state.get_game(game_id).await {
+                let status_data = util::make_update_game_status(&game_info)?;
+                util::broadcast_packet(&state, msg::UPDATE_GAME_STATUS, status_data).await?;
+            }
+        }
+    }
+
     util::record_processing_time("quit_game", start.elapsed());
     Ok(())
 }
@@ -444,6 +470,15 @@ pub async fn handle_start_game(
         );
         return Ok(()); // Silently ignore invalid request
     }
+
+    // Defensive: drop any tombstoned (left-the-room) players before sizing the sync
+    // engine, so a stray ghost can never get a sync slot in the new game. Normally
+    // game-end compaction already cleared these.
+    util::with_game_mut(&state, src, |game_info| {
+        game_info.players.retain(|p| !p.left_room);
+        game_info.num_players = game_info.players.len() as u8;
+    })
+    .await?;
 
     // Get game info first to get player list
     let game_info_before = util::fetch_game_info(src, &state).await?;
@@ -575,7 +610,7 @@ pub async fn execute_drop_game(
     };
 
     // Mark player as dropped and get all necessary data
-    let (outputs, players, _all_dropped) = {
+    let (outputs, players, all_dropped) = {
         let game_arc = state
             .get_game_arc(game_id)
             .await
@@ -601,18 +636,42 @@ pub async fn execute_drop_game(
             .sync
             .all_players_dropped();
 
+        // Clone the player list BEFORE any compaction: `outputs` are indexed by the
+        // live sync slot, so the target lookup below must use the original order.
+        let players = game_info.players.clone();
+
         if all_dropped {
+            // Game over → sync goes inactive, so reindexing the Vec is now safe.
             game_info.game_status = GAME_STATUS_WAITING;
+            game_info.sync_manager = None;
+            // Purge players who left the room mid-game (tombstones); plain drops
+            // stay in the room and can start another game.
+            game_info.players.retain(|p| !p.left_room);
+            game_info.num_players = game_info.players.len() as u8;
+            migrate_owner_if_needed(&mut game_info);
             let status_data = util::make_update_game_status(&game_info)?;
             util::broadcast_packet(state, msg::UPDATE_GAME_STATUS, status_data).await?;
-            game_info.sync_manager = None;
         }
-
-        // Clone data before releasing the lock
-        let players = game_info.players.clone();
 
         (outputs, players, all_dropped)
     };
+
+    // If the game ended and everyone had left the room (not just dropped), close it
+    // rather than leaving an empty room behind.
+    if all_dropped {
+        let empty = state
+            .get_game(game_id)
+            .await
+            .map(|g| g.players.is_empty())
+            .unwrap_or(true);
+        if empty {
+            info!("All players left during play - closing game");
+            state.remove_game(game_id).await;
+            let close = packet_util::build_close_game_packet(game_id);
+            util::broadcast_packet(state, msg::CLOSE_GAME, close).await?;
+            return Ok(true);
+        }
+    }
 
     // Update all players' status back to IDLE (waiting in room)
     for player in &players {
