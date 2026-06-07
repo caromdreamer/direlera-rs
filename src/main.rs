@@ -312,9 +312,15 @@ async fn main() -> color_eyre::Result<()> {
         _ => LogFormat::Compact,
     };
 
-    // Build optional Loki push config (additive to stdout). Disabled when the
-    // toggle is off or no URL is set.
-    let loki = if config.logs_push_enabled && !config.logs_push_url.is_empty() {
+    // Build optional Loki push config (additive to stdout). Disabled unless the
+    // toggle is on, a URL is set, and server_id is non-empty (the latter is the
+    // Loki label; pushing without it would flood the collector with anonymous,
+    // colliding streams). Runs before the subscriber is installed, so diagnostics
+    // go to stderr via eprintln!.
+    let loki = if config.logs_push_enabled
+        && !config.logs_push_url.is_empty()
+        && !config.server_id.is_empty()
+    {
         Some(LokiConfig {
             url: config.logs_push_url.clone(),
             server_id: config.server_id.clone(),
@@ -325,6 +331,12 @@ async fn main() -> color_eyre::Result<()> {
     } else {
         if config.logs_push_enabled && config.logs_push_url.is_empty() {
             eprintln!("logs_push_enabled = true but logs_push_url is empty — log push disabled");
+        }
+        if config.logs_push_enabled
+            && !config.logs_push_url.is_empty()
+            && config.server_id.is_empty()
+        {
+            eprintln!("logs_push_enabled = true but server_id is empty — log push disabled (set a unique server_id in config.toml)");
         }
         None
     };

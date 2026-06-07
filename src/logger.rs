@@ -81,15 +81,9 @@ pub fn init_logger(format: LogFormat, level: LogLevel, loki: Option<LokiConfig>)
     // take down logging, so we warn via stderr (the subscriber isn't up yet).
     let mut bg_task = None;
     if let Some(cfg) = loki {
-        let server_id = if cfg.server_id.is_empty() {
-            eprintln!(
-                "server_id is empty; pushing logs as 'unknown'. \
-                 Set a unique server_id in config.toml."
-            );
-            "unknown".to_string()
-        } else {
-            cfg.server_id.clone()
-        };
+        // The caller only constructs `loki` when server_id is non-empty (it gates
+        // the central collector's stream label), so it can be used directly.
+        let server_id = cfg.server_id.clone();
         match build_loki_layer(&cfg, &server_id) {
             Ok((layer, task)) => {
                 layers.push(layer.boxed());
