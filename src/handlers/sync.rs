@@ -83,22 +83,10 @@ pub async fn handle_game_data(
     let data_length = buf.get_u16_le() as usize;
     let game_data = buf.split_to(data_length).to_vec();
 
-    let client = state
-        .get_client(src)
-        .await
-        .ok_or_else(|| eyre!("Client not found"))?;
-    let game_id = client.game_id.ok_or_else(|| eyre!("Game ID not found"))?;
-
-    // Find player_id from address
-    let game_info = state
-        .get_game(game_id)
-        .await
-        .ok_or_else(|| eyre!("Game not found"))?;
-    let player_id = game_info
-        .players
-        .iter()
-        .position(|p| p.addr == *src)
-        .ok_or_else(|| eyre!("Player not in game"))?;
+    let Some((game_id, player_id)) = util::resolve_in_game(&state, src).await else {
+        debug!("Dropping game_data: client no longer in a game (post-teardown race)");
+        return Ok(());
+    };
     tracing::Span::current().record("player_id", player_id);
 
     // Process with SimpleGameSync (per-game lock — does not block other games)
@@ -181,22 +169,10 @@ pub async fn handle_game_cache(
     let _ = buf.get_u8(); // Empty String
     let cache_position = buf.get_u8();
 
-    let client = state
-        .get_client(src)
-        .await
-        .ok_or_else(|| eyre!("Client not found"))?;
-    let game_id = client.game_id.ok_or_else(|| eyre!("Game ID not found"))?;
-
-    // Find player_id from address
-    let game_info = state
-        .get_game(game_id)
-        .await
-        .ok_or_else(|| eyre!("Game not found"))?;
-    let player_id = game_info
-        .players
-        .iter()
-        .position(|p| p.addr == *src)
-        .ok_or_else(|| eyre!("Player not in game"))?;
+    let Some((game_id, player_id)) = util::resolve_in_game(&state, src).await else {
+        debug!("Dropping game_cache: client no longer in a game (post-teardown race)");
+        return Ok(());
+    };
     tracing::Span::current().record("player_id", player_id);
 
     // Process with SimpleGameSync. Return GameSyncError directly so we can inspect

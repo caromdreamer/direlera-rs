@@ -668,6 +668,20 @@ pub async fn fetch_game_info(
         .ok_or_else(|| eyre!("Game not found: game_id={}", game_id))
 }
 
+/// Resolve `(game_id, player_id)` for a client sending in-game traffic
+/// (game_data / game_cache / drop). Returns `None` when the client is no longer
+/// in a game: a benign race that happens after the other player quits and the
+/// game is torn down while this client's in-flight packets are still arriving.
+/// Callers should silently drop the packet (debug log + `Ok(())`) instead of
+/// bubbling an error that the message loop would log at `error!`.
+pub async fn resolve_in_game(state: &AppState, src: &std::net::SocketAddr) -> Option<(u32, usize)> {
+    let client = state.get_client(src).await?;
+    let game_id = client.game_id?;
+    let game_info = state.get_game(game_id).await?;
+    let player_id = game_info.players.iter().position(|p| p.addr == *src)?;
+    Some((game_id, player_id))
+}
+
 pub async fn with_client_mut<F, R>(
     state: &AppState,
     src: &std::net::SocketAddr,

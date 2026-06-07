@@ -287,7 +287,11 @@ fn load_config() -> Config {
 }
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
-    color_eyre::install()?;
+    // Blank theme: error reports go to structured logs (no TTY), so the default
+    // ANSI color codes (e.g. \x1b[35m) only show up as noise like "[35m" in logs.
+    color_eyre::config::HookBuilder::default()
+        .theme(color_eyre::config::Theme::new())
+        .install()?;
     // Load configuration from config.toml
     let config = load_config();
 

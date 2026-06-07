@@ -672,13 +672,10 @@ pub async fn handle_drop_game(
     let start = Instant::now();
     debug!("Drop game request received");
 
-    let client = state
-        .get_client(src)
-        .await
-        .ok_or_else(|| eyre!("Client not found"))?;
-    let game_id = client
-        .game_id
-        .ok_or_else(|| eyre!("Client not in a game"))?;
+    let Some((game_id, _player_id)) = util::resolve_in_game(&state, src).await else {
+        debug!("Drop game ignored: client no longer in a game (post-teardown race)");
+        return Ok(());
+    };
 
     execute_drop_game(game_id, src, &state).await?;
     util::record_processing_time("drop_game", start.elapsed());
