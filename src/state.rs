@@ -296,10 +296,12 @@ pub struct GamePlayerInfo {
     pub username: Vec<u8>, // Store as bytes to preserve original encoding
     pub user_id: u16,
     pub conn_type: u8,
-    /// Timestamp of last received game_data packet (for jitter calculation)
+    /// Timestamp of last received input packet (game_data or cache), for pacing.
     pub last_game_data_recv: Option<std::time::Instant>,
-    /// Most recent inter-arrival interval (for consecutive diff jitter)
-    pub last_interval_secs: Option<f64>,
+    /// EWMA baseline of the inter-arrival interval (seconds). Self-normalizes the
+    /// pace per game (fps / conn_type / batching independent) so we can report the
+    /// current/baseline ratio as a smoothness signal.
+    pub interval_baseline_secs: Option<f64>,
 }
 
 impl GamePlayerInfo {
@@ -316,6 +318,20 @@ impl GamePlayerInfo {
     }
 }
 
+/// Precomputed Prometheus label values for a game. These never change after
+/// creation, and the metrics hot path runs per input packet, so we build them
+/// once and share via Arc (GameInfo is cloned per packet — keep that cheap).
+/// `game_uid` is a per-game UUID used only for observability; the wire-protocol
+/// `game_id` (short, sent to clients) is unchanged. The UUID makes each game a
+/// distinct metric series even across server restarts (sequential game_id resets
+/// to 1 on restart and would otherwise merge with the previous run's series).
+#[derive(Debug, Clone)]
+pub struct GameMetricLabels {
+    pub game_uid: String,
+    pub game_name: String,
+    pub emulator_name: String,
+}
+
 #[derive(Debug, Clone)]
 pub struct GameInfo {
     pub game_id: u32,
@@ -330,6 +346,8 @@ pub struct GameInfo {
     pub players: Vec<GamePlayerInfo>,
     // New: SimpleGameSync for frame synchronization
     pub sync_manager: Option<simplest_game_sync::CachedGameSync>,
+    /// Precomputed metric labels (uid/title/emulator), shared cheaply on clone.
+    pub metric_labels: std::sync::Arc<GameMetricLabels>,
 }
 
 impl GameInfo {

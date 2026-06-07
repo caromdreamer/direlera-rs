@@ -9,6 +9,61 @@ use crate::kaillera::message_types as msg;
 use crate::simplest_game_sync;
 use crate::*;
 
+/// EWMA smoothing factor for the per-player interval baseline. Small enough that
+/// transient spikes barely move the baseline, so a real slowdown surfaces as a
+/// ratio > 1 instead of being absorbed into "normal".
+const INTERVAL_BASELINE_ALPHA: f64 = 0.1;
+
+/// Record input-pacing metrics for a player on every input packet (game_data or
+/// game_cache). The pace ratio (current interval / the game's own EWMA baseline)
+/// is fps/conn_type/batching-agnostic: 1.0 means on pace, 2.0 means running at
+/// half the game's normal speed (a stall/lag). Call inside the per-game lock.
+fn record_input_pacing(
+    player: &mut GamePlayerInfo,
+    now: std::time::Instant,
+    labels: &GameMetricLabels,
+    player_count: usize,
+) {
+    if let Some(last_recv) = player.last_game_data_recv {
+        let interval = now.duration_since(last_recv).as_secs_f64();
+        // Per-game labels so a single bad game can be isolated on a dashboard
+        // (one stalling game would otherwise drag the whole aggregate down).
+        // game_uid is a restart-safe UUID; series are bounded by the exporter's
+        // idle_timeout (main.rs). Label values are precomputed (no hot-path alloc).
+        let uid = labels.game_uid.clone();
+        let title = labels.game_name.clone();
+        let emulator = labels.emulator_name.clone();
+        let pc = player_count.to_string();
+        // Absolute interval — for an at-a-glance pace view.
+        metrics::histogram!(
+            "client_input_interval_seconds",
+            "game_uid" => uid.clone(),
+            "game_name" => title.clone(),
+            "emulator_name" => emulator.clone(),
+            "player_count" => pc.clone(),
+        )
+        .record(interval);
+        match player.interval_baseline_secs {
+            Some(baseline) if baseline > 0.0 => {
+                metrics::histogram!(
+                    "client_input_pace_ratio",
+                    "game_uid" => uid,
+                    "game_name" => title,
+                    "emulator_name" => emulator,
+                    "player_count" => pc,
+                )
+                .record(interval / baseline);
+                player.interval_baseline_secs = Some(
+                    INTERVAL_BASELINE_ALPHA * interval + (1.0 - INTERVAL_BASELINE_ALPHA) * baseline,
+                );
+            }
+            // First interval just seeds the baseline; no ratio emitted yet.
+            _ => player.interval_baseline_secs = Some(interval),
+        }
+    }
+    player.last_game_data_recv = Some(now);
+}
+
 /*
 - **NB**: Empty String `[00]`
 - **2B**: Length of Game Data
@@ -49,23 +104,13 @@ pub async fn handle_game_data(
     // Process with SimpleGameSync (per-game lock — does not block other games)
     let (outputs, cache_overflowed, cache_milestone) = state
         .update_game(game_id, |game_info| {
-            // Jitter: consecutive inter-arrival time difference for this player
+            // Input pacing: how fast this player's inputs arrive vs the game's
+            // own steady-state pace (fps/conn_type-agnostic stall signal).
             let now = Instant::now();
-            let player_count = game_info.players.len().to_string();
+            let player_count = game_info.players.len();
+            let labels = game_info.metric_labels.clone();
             if let Some(player) = game_info.players.get_mut(player_id) {
-                if let Some(last_recv) = player.last_game_data_recv {
-                    let interval = now.duration_since(last_recv).as_secs_f64();
-                    if let Some(last_interval) = player.last_interval_secs {
-                        let jitter = (interval - last_interval).abs();
-                        metrics::histogram!(
-                            "game_data_jitter_seconds",
-                            "player_count" => player_count,
-                        )
-                        .record(jitter);
-                    }
-                    player.last_interval_secs = Some(interval);
-                }
-                player.last_game_data_recv = Some(now);
+                record_input_pacing(player, now, &labels, player_count);
             }
 
             let sync_manager = game_info
@@ -169,9 +214,14 @@ pub async fn handle_game_cache(
     // the variant before converting to eyre (cache-miss needs a client notification).
     let sync_result: Result<_, simplest_game_sync::GameSyncError> = state
         .update_game(game_id, |game_info| {
-            // Track last game input time for stall detection (same as game_data).
+            // Cache packets are the bulk of steady-state traffic, so they must
+            // feed the same pacing metric as game_data (else most of the game
+            // is invisible to the responsiveness signal).
+            let now = Instant::now();
+            let player_count = game_info.players.len();
+            let labels = game_info.metric_labels.clone();
             if let Some(player) = game_info.players.get_mut(player_id) {
-                player.last_game_data_recv = Some(Instant::now());
+                record_input_pacing(player, now, &labels, player_count);
             }
             let sync_manager = game_info.sync_manager.as_mut().ok_or(
                 simplest_game_sync::GameSyncError::BufferInconsistency {

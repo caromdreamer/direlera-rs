@@ -76,8 +76,14 @@ pub async fn handle_create_game(
             user_id,
             conn_type,
             last_game_data_recv: None,
-            last_interval_secs: None,
+            interval_baseline_secs: None,
         }],
+        metric_labels: Arc::new(GameMetricLabels {
+            // Observability-only UUID; the wire game_id sent to clients is unchanged.
+            game_uid: uuid::Uuid::new_v4().to_string(),
+            game_name: util::sanitize_label(&game_name),
+            emulator_name: util::sanitize_label(&emulator_name),
+        }),
     };
 
     // Add game
@@ -175,7 +181,7 @@ pub async fn handle_join_game(
                 user_id,
                 conn_type,
                 last_game_data_recv: None,
-                last_interval_secs: None,
+                interval_baseline_secs: None,
             });
         } else {
             debug!("Player already in game, skipping duplicate");

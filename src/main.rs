@@ -273,11 +273,41 @@ async fn main() -> color_eyre::Result<()> {
         0.1,      // 100ms
         0.5,      // 500ms
     ];
+    // The pace ratio is dimensionless (~1.0 = on pace, 2.0 = half speed), so it
+    // needs its own buckets — the time-based defaults above (5µs–500ms) would
+    // dump every ratio sample into +Inf.
+    let ratio_buckets = &[0.8, 0.9, 1.0, 1.1, 1.25, 1.5, 2.0, 3.0, 5.0, 10.0];
+    // Input arrival interval — frame-period resolution so common frame rates land
+    // in distinct buckets (60fps≈16.7ms, 50fps=20ms, 30fps≈33.3ms, 20fps=50ms)
+    // and slowdowns are visible. The default buckets jump 10ms→50ms, lumping all
+    // playable rates into one bucket.
+    let interval_buckets = &[
+        0.004, 0.008, 0.012, 0.016, 0.02, 0.025, 0.033, 0.04, 0.05, 0.066, 0.1, 0.2, 0.5,
+    ];
     if config.metrics_enabled {
         metrics_exporter_prometheus::PrometheusBuilder::new()
             .with_http_listener(([0, 0, 0, 0], config.metrics_port))
             .set_buckets(buckets)
             .expect("Failed to set histogram buckets")
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Full("client_input_pace_ratio".to_string()),
+                ratio_buckets,
+            )
+            .expect("Failed to set pace-ratio buckets")
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Full(
+                    "client_input_interval_seconds".to_string(),
+                ),
+                interval_buckets,
+            )
+            .expect("Failed to set input-interval buckets")
+            // Per-game metrics are labeled by game_id, so their series must not
+            // accumulate forever. Expire histograms idle for 5 min: ended games
+            // get reclaimed, while in-progress games update constantly and stay.
+            .idle_timeout(
+                metrics_util::MetricKindMask::HISTOGRAM,
+                Some(std::time::Duration::from_secs(300)),
+            )
             .install()
             .expect("Failed to start Prometheus metrics exporter");
         info!(

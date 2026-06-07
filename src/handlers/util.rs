@@ -460,6 +460,18 @@ pub fn bytes_for_log(bytes: &[u8]) -> String {
     decoded
 }
 
+/// Sanitize a user-supplied name (game title / emulator) for use as a Prometheus
+/// label value: decode to text, drop control chars, and cap the length so a
+/// malicious or odd name can't blow up label cardinality/size. Call once per
+/// game (cached), never in the per-packet path.
+pub fn sanitize_label(bytes: &[u8]) -> String {
+    bytes_for_log(bytes)
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(32)
+        .collect()
+}
+
 /// Convert bytes to a readable string, trying multiple encodings
 /// Returns the decoded string (for display/logging purposes)
 pub fn bytes_to_string(bytes: &[u8]) -> String {
