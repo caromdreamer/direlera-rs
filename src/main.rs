@@ -1,4 +1,4 @@
-use direlera_rs::logger::{init_logger, LogFormat, LogLevel};
+use direlera_rs::logger::{init_logger, LogFormat, LogLevel, LokiConfig};
 use packet_util::*;
 use serde::Deserialize;
 use std::fs;
@@ -37,6 +37,42 @@ pub struct Config {
     pub metrics_enabled: bool,
     #[serde(default = "default_metrics_port")]
     pub metrics_port: u16,
+    /// Unique identifier for this server, attached as a label to pushed metrics
+    /// (and, later, logs) so a central collector can tell servers apart. Must be
+    /// unique across all servers reporting to the same backend.
+    #[serde(default)]
+    pub server_id: String,
+    /// When true, push metrics to a Prometheus Pushgateway instead of exposing
+    /// the local scrape endpoint. Mutually exclusive with the scrape listener:
+    /// enabling push disables `metrics_port`. Designed for servers behind
+    /// NAT/firewall that a central Prometheus cannot scrape directly.
+    #[serde(default)]
+    pub metrics_push_enabled: bool,
+    /// Base URL of the Pushgateway (typically behind an HTTPS reverse proxy),
+    /// e.g. "https://metrics.example.com". The job/server_id path is appended
+    /// automatically.
+    #[serde(default)]
+    pub metrics_push_url: String,
+    /// How often (seconds) to push metrics to the gateway.
+    #[serde(default = "default_metrics_push_interval")]
+    pub metrics_push_interval_secs: u64,
+    /// Optional HTTP basic-auth credentials for the push endpoint.
+    #[serde(default)]
+    pub metrics_push_username: String,
+    #[serde(default)]
+    pub metrics_push_password: String,
+    /// When true, push logs to a Loki endpoint (in addition to stdout). Designed,
+    /// like metrics push, for servers a central collector cannot reach to scrape.
+    #[serde(default)]
+    pub logs_push_enabled: bool,
+    /// Base URL of the Loki server, e.g. "https://loki.example.com".
+    #[serde(default)]
+    pub logs_push_url: String,
+    /// Optional HTTP basic-auth credentials for the Loki push endpoint.
+    #[serde(default)]
+    pub logs_push_username: String,
+    #[serde(default)]
+    pub logs_push_password: String,
     #[serde(default)]
     pub master_list: MasterListConfig,
 }
@@ -50,6 +86,16 @@ impl Default for Config {
             welcome_message: default_welcome_message(),
             metrics_enabled: false,
             metrics_port: default_metrics_port(),
+            server_id: String::new(),
+            metrics_push_enabled: false,
+            metrics_push_url: String::new(),
+            metrics_push_interval_secs: default_metrics_push_interval(),
+            metrics_push_username: String::new(),
+            metrics_push_password: String::new(),
+            logs_push_enabled: false,
+            logs_push_url: String::new(),
+            logs_push_username: String::new(),
+            logs_push_password: String::new(),
             master_list: MasterListConfig::default(),
         }
     }
@@ -184,6 +230,10 @@ fn default_metrics_port() -> u16 {
     9091
 }
 
+fn default_metrics_push_interval() -> u64 {
+    15
+}
+
 fn default_main_port() -> u16 {
     8080
 }
@@ -254,7 +304,24 @@ async fn main() -> color_eyre::Result<()> {
         _ => LogFormat::Compact,
     };
 
-    init_logger(log_format, log_level);
+    // Build optional Loki push config (additive to stdout). Disabled when the
+    // toggle is off or no URL is set.
+    let loki = if config.logs_push_enabled && !config.logs_push_url.is_empty() {
+        Some(LokiConfig {
+            url: config.logs_push_url.clone(),
+            server_id: config.server_id.clone(),
+            username: (!config.logs_push_username.is_empty())
+                .then(|| config.logs_push_username.clone()),
+            password: config.logs_push_password.clone(),
+        })
+    } else {
+        if config.logs_push_enabled && config.logs_push_url.is_empty() {
+            eprintln!("logs_push_enabled = true but logs_push_url is empty — log push disabled");
+        }
+        None
+    };
+
+    init_logger(log_format, log_level, loki);
 
     // Buckets in seconds. Without explicit buckets the exporter emits summary
     // type instead of histogram, which breaks histogram_quantile() in PromQL.
@@ -284,9 +351,15 @@ async fn main() -> color_eyre::Result<()> {
     let interval_buckets = &[
         0.004, 0.008, 0.012, 0.016, 0.02, 0.025, 0.033, 0.04, 0.05, 0.066, 0.1, 0.2, 0.5,
     ];
-    if config.metrics_enabled {
-        metrics_exporter_prometheus::PrometheusBuilder::new()
-            .with_http_listener(([0, 0, 0, 0], config.metrics_port))
+    // Push mode requires a destination URL; warn and fall back to off if missing.
+    let push_ok = config.metrics_push_enabled && !config.metrics_push_url.is_empty();
+    if config.metrics_push_enabled && config.metrics_push_url.is_empty() {
+        warn!("metrics_push_enabled = true but metrics_push_url is empty — metrics push disabled");
+    }
+
+    if push_ok || config.metrics_enabled {
+        // Builder config shared by both modes (buckets + idle expiry).
+        let builder = metrics_exporter_prometheus::PrometheusBuilder::new()
             .set_buckets(buckets)
             .expect("Failed to set histogram buckets")
             .set_buckets_for_metric(
@@ -307,13 +380,82 @@ async fn main() -> color_eyre::Result<()> {
             .idle_timeout(
                 metrics_util::MetricKindMask::HISTOGRAM,
                 Some(std::time::Duration::from_secs(300)),
-            )
-            .install()
-            .expect("Failed to start Prometheus metrics exporter");
-        info!(
-            port = config.metrics_port,
-            "Prometheus metrics exporter started"
-        );
+            );
+
+        // Push and scrape-listener are mutually exclusive in the exporter; push
+        // wins when enabled (the unified path for NAT/firewalled servers).
+        if push_ok {
+            let server_id = if config.server_id.is_empty() {
+                warn!(
+                    "server_id is empty; pushing metrics as 'unknown'. \
+                     Set a unique server_id in config.toml."
+                );
+                "unknown".to_string()
+            } else {
+                config.server_id.clone()
+            };
+            // Build the full Pushgateway grouping path: server_id becomes a label
+            // and must be unique per server, else gateways overwrite each other's
+            // group. We push via reqwest (already a dependency, ring-backed) rather
+            // than the exporter's built-in push-gateway feature, which forces an
+            // aws-lc-rs/cmake build chain that breaks the slim Docker image.
+            let base = config.metrics_push_url.trim_end_matches('/');
+            let endpoint = format!("{base}/metrics/job/direlera/server_id/{server_id}");
+            let username = (!config.metrics_push_username.is_empty())
+                .then(|| config.metrics_push_username.clone());
+            let password = config.metrics_push_password.clone();
+            let interval = std::time::Duration::from_secs(config.metrics_push_interval_secs);
+
+            let handle = builder
+                .install_recorder()
+                .expect("Failed to install Prometheus recorder");
+            // Bound each request by the push interval so a hung/slow endpoint
+            // can't wedge the task — which would also stall run_upkeep() and let
+            // idle histograms accumulate. A failed push just retries next tick.
+            let client = reqwest::Client::builder()
+                .timeout(interval)
+                .build()
+                .expect("Failed to build metrics push HTTP client");
+            info!(
+                endpoint = endpoint.as_str(),
+                interval_secs = config.metrics_push_interval_secs,
+                server_id = server_id.as_str(),
+                "Prometheus metrics push started"
+            );
+
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(interval);
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    handle.run_upkeep();
+                    let body = handle.render();
+                    // PUT replaces the whole group each push, so a restarted/stale
+                    // server's metrics get overwritten rather than duplicated.
+                    let mut req = client.put(&endpoint).body(body);
+                    if let Some(user) = &username {
+                        req = req.basic_auth(user, Some(&password));
+                    }
+                    match req.send().await {
+                        Ok(resp) if resp.status().is_success() => {}
+                        Ok(resp) => warn!(
+                            status = %resp.status(),
+                            "metrics push returned non-success status"
+                        ),
+                        Err(e) => warn!(error = %e, "failed to push metrics"),
+                    }
+                }
+            });
+        } else {
+            builder
+                .with_http_listener(([0, 0, 0, 0], config.metrics_port))
+                .install()
+                .expect("Failed to start Prometheus metrics exporter");
+            info!(
+                port = config.metrics_port,
+                "Prometheus metrics exporter started"
+            );
+        }
     } else {
         info!("Prometheus metrics exporter disabled");
     }

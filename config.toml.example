@@ -8,6 +8,40 @@ Welcome to the Kaillera server!
 Have fun and play fair.
 """
 
+# ── Prometheus metrics ───────────────────────────────────────────────────────
+# Two mutually exclusive modes:
+#   1. Scrape (pull): expose a local /metrics endpoint for Prometheus to scrape.
+#   2. Push: the server pushes metrics to a Prometheus Pushgateway itself —
+#      use this when the server is behind NAT/firewall and cannot be scraped.
+
+# Scrape mode: expose a local metrics endpoint on metrics_port.
+metrics_enabled = false
+metrics_port = 9091
+
+# Unique identifier for this server. Attached as a label so a central collector
+# can tell servers apart. MUST be unique per server when pushing (otherwise
+# servers overwrite each other's metrics on the gateway).
+server_id = ""
+
+# Push mode. When true, the local scrape endpoint above is NOT started; instead
+# metrics are PUT to the Pushgateway every metrics_push_interval_secs.
+metrics_push_enabled = false
+metrics_push_url = "https://metrics.example.com"   # Pushgateway base URL (behind HTTPS proxy)
+metrics_push_interval_secs = 15
+metrics_push_username = ""   # optional HTTP basic auth
+metrics_push_password = ""
+
+# ── Log push (Loki) ──────────────────────────────────────────────────────────
+# When enabled, logs are pushed to a Loki endpoint IN ADDITION to stdout (local
+# console / docker logs are always preserved). Like metrics push, this suits
+# servers a central collector cannot reach. Uses the server_id label above.
+# Keep tracing.level at "info" in production — "debug"/"trace" greatly increase
+# log volume (and thus push load).
+logs_push_enabled = false
+logs_push_url = "https://loki.example.com"   # base URL; /loki/api/v1/push is appended
+logs_push_username = ""   # optional HTTP basic auth
+logs_push_password = ""
+
 [master_list]
 # Set enabled = true to announce this server on public master lists.
 enabled = false
