@@ -481,11 +481,14 @@ async fn process_packet_in_session(
                 }
             }
 
+            let had_messages = !messages.is_empty();
+            let mut processed = 0u32;
             for message in messages {
                 let message_number_to_process = *packet_counter;
 
                 if message.message_number == message_number_to_process {
                     *packet_counter = message_number_to_process + 1;
+                    processed += 1;
 
                     let msg_number = message.message_number;
                     let msg_type = message.message_type;
@@ -503,6 +506,16 @@ async fn process_packet_in_session(
                         );
                     }
                 }
+            }
+
+            // A packet that yielded zero newly-processed messages (all of its
+            // messages were already-seen duplicates) is the client re-sending its
+            // last bundle while it waits on the server — a "0 new messages" stall
+            // signal. We recover via the server-side stall-resend task, so here we
+            // only meter how often this happens to gauge whether a pull-based
+            // resend (acting directly on this signal) would be worth adding.
+            if had_messages && processed == 0 {
+                metrics::counter!("inbound_zero_new_packets_total").increment(1);
             }
         }
         Err(e) => {

@@ -197,8 +197,8 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
             tokio::time::sleep(STALL_RESEND_INTERVAL).await;
             let now = Instant::now();
 
-            // Collect addresses of stalled players in playing games.
-            let stalled: Vec<SocketAddr> = {
+            // Collect stalled players (with their game's metric labels) in playing games.
+            let stalled: Vec<(SocketAddr, Arc<crate::state::GameMetricLabels>)> = {
                 let game_ids: Vec<u32> =
                     { global_state.games.read().await.keys().copied().collect() };
                 let mut out = Vec::new();
@@ -210,7 +210,7 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                         for p in &game.players {
                             if let Some(last) = p.last_game_data_recv {
                                 if now.duration_since(last) >= STALL_THRESHOLD {
-                                    out.push(p.addr);
+                                    out.push((p.addr, game.metric_labels.clone()));
                                 }
                             }
                         }
@@ -219,8 +219,11 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                 out
             };
 
+            // How many players are stalled right now (across all playing games).
+            metrics::gauge!("stalled_players").set(stalled.len() as f64);
+
             // Resend each stalled client's last packet verbatim (same msg numbers).
-            for addr in stalled {
+            for (addr, labels) in stalled {
                 let last = {
                     let addr_map = global_state.clients_by_addr.read().await;
                     let id_map = global_state.clients_by_id.read().await;
@@ -231,6 +234,15 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                 };
                 if let Some(data) = last {
                     let _ = global_state.tx.send(crate::Message { data, addr }).await;
+                    // game_name/emulator_name (not the per-instance game_uid) keep
+                    // this counter's cardinality bounded by the real game catalog,
+                    // so it needs no idle-expiry like the histogram series do.
+                    metrics::counter!(
+                        "stall_resends_total",
+                        "game_name" => labels.game_name.clone(),
+                        "emulator_name" => labels.emulator_name.clone(),
+                    )
+                    .increment(1);
                 }
             }
         }
