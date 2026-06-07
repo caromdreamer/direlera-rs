@@ -31,18 +31,30 @@ struct UdpSession {
 pub struct SessionManager {
     sessions: Arc<RwLock<HashMap<SocketAddr, UdpSession>>>,
     packet_tx: mpsc::Sender<(SocketAddr, Vec<u8>)>,
+    /// Signals that a session should be torn down immediately (e.g. the client
+    /// quit normally). Removing the `sessions` entry drops the last `tx`, so the
+    /// session task's `rx.recv()` returns `None` and it ends gracefully instead
+    /// of waiting out SESSION_TIMEOUT.
+    session_close_tx: mpsc::Sender<SocketAddr>,
 }
 
 impl SessionManager {
-    pub fn new() -> (Self, mpsc::Receiver<(SocketAddr, Vec<u8>)>) {
+    #[allow(clippy::type_complexity)]
+    pub fn new() -> (
+        Self,
+        mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+        mpsc::Receiver<SocketAddr>,
+    ) {
         let (packet_tx, packet_rx) = mpsc::channel(1000);
+        let (session_close_tx, session_close_rx) = mpsc::channel(1000);
 
         let manager = Self {
             sessions: Arc::new(RwLock::new(HashMap::new())),
             packet_tx,
+            session_close_tx,
         };
 
-        (manager, packet_rx)
+        (manager, packet_rx, session_close_rx)
     }
 
     /// Get the sender for the main UDP dispatcher to send packets
@@ -50,31 +62,53 @@ impl SessionManager {
         self.packet_tx.clone()
     }
 
+    /// Get the sender used to request immediate teardown of a session.
+    pub fn session_close_sender(&self) -> mpsc::Sender<SocketAddr> {
+        self.session_close_tx.clone()
+    }
+
     /// Start the session manager - spawns session handlers as needed
     pub async fn run(
         self: Arc<Self>,
         mut packet_rx: mpsc::Receiver<(SocketAddr, Vec<u8>)>,
+        mut session_close_rx: mpsc::Receiver<SocketAddr>,
         global_state: Arc<AppState>,
     ) {
         info!("Session manager started");
 
-        while let Some((addr, data)) = packet_rx.recv().await {
-            let sessions = self.sessions.read().await;
+        loop {
+            tokio::select! {
+                maybe_packet = packet_rx.recv() => {
+                    let Some((addr, data)) = maybe_packet else { break };
+                    let sessions = self.sessions.read().await;
 
-            if let Some(session) = sessions.get(&addr) {
-                // Existing session - forward packet
-                if let Err(e) = session.tx.send(data).await {
-                    warn!(
-                        { fields::ADDR } = %addr,
-                        { fields::ERROR } = %e,
-                        "Failed to forward packet to session"
-                    );
+                    if let Some(session) = sessions.get(&addr) {
+                        // Existing session - forward packet
+                        if let Err(e) = session.tx.send(data).await {
+                            warn!(
+                                { fields::ADDR } = %addr,
+                                { fields::ERROR } = %e,
+                                "Failed to forward packet to session"
+                            );
+                        }
+                    } else {
+                        // New session - spawn handler
+                        drop(sessions);
+                        self.spawn_session_handler(addr, data, global_state.clone())
+                            .await;
+                    }
                 }
-            } else {
-                // New session - spawn handler
-                drop(sessions);
-                self.spawn_session_handler(addr, data, global_state.clone())
-                    .await;
+                maybe_close = session_close_rx.recv() => {
+                    let Some(addr) = maybe_close else { break };
+                    // Drop the session entry: this drops the last `tx`, so the
+                    // session task's `rx.recv()` returns `None` and it shuts down
+                    // gracefully (Ok(None) branch) instead of waiting out the
+                    // full SESSION_TIMEOUT and emitting a spurious timeout notice.
+                    let removed = { self.sessions.write().await.remove(&addr) };
+                    if removed.is_some() {
+                        info!({ fields::ADDR } = %addr, "Session closed on request");
+                    }
+                }
             }
         }
     }
@@ -286,6 +320,12 @@ async fn handle_session(
         // Per-session packet counter — no global lock needed
         let mut packet_counter: u16 = 0;
 
+        // Last-known identity (log-friendly name + user_id), cached once the
+        // client logs in. If the client is already gone from global state by the
+        // time a timeout fires (e.g. cleanup_task won the race), this still lets
+        // the timeout notice name who dropped instead of falling back to ip:port.
+        let mut cached_identity: Option<(String, u16)> = None;
+
         // Session loop - similar to TCP recv loop
         loop {
             match timeout(SESSION_TIMEOUT, rx.recv()).await {
@@ -306,6 +346,15 @@ async fn handle_session(
                         &mut packet_counter,
                     )
                     .await;
+
+                    // Cache identity once it exists (cheap: only until populated,
+                    // so the hot game-input path skips the lookup afterward).
+                    if cached_identity.is_none() {
+                        if let Some(client_info) = global_state.get_client(&addr).await {
+                            let name = crate::handlers::util::bytes_for_log(&client_info.username);
+                            cached_identity = Some((name, client_info.user_id));
+                        }
+                    }
                 }
                 Ok(None) => {
                     // Notify lobby and perform quit if necessary before breaking
@@ -341,8 +390,11 @@ async fn handle_session(
                     if let Some(client_info) = global_state.get_client(&addr).await {
                         let username = crate::handlers::util::bytes_for_log(&client_info.username);
                         // 글로벌 채팅으로 타임아웃 알림 (디버깅용)
-                        let notice =
-                            format!("[Server] {} timed out (keepalive not received)", username);
+                        // 닉네임 + user_id + ip:port 까지 실어 누가 끊겼는지 식별 가능하게.
+                        let notice = format!(
+                            "[Server] {} (#{}, {}) timed out (keepalive not received)",
+                            username, client_info.user_id, addr
+                        );
                         let data =
                             packet_util::build_global_chat_packet(b"Server", notice.as_bytes());
                         let _ = crate::handlers::util::broadcast_packet(
@@ -373,6 +425,21 @@ async fn handle_session(
                             )
                             .await;
                         }
+                    } else if let Some((name, user_id)) = &cached_identity {
+                        // Client already removed from global state (e.g. cleanup
+                        // race), but we cached its identity at login — still name it.
+                        let notice = format!(
+                            "[Server] {} (#{}, {}) timed out (keepalive not received)",
+                            name, user_id, addr
+                        );
+                        let data =
+                            packet_util::build_global_chat_packet(b"Server", notice.as_bytes());
+                        let _ = crate::handlers::util::broadcast_packet(
+                            &global_state,
+                            msg::GLOBAL_CHAT,
+                            data,
+                        )
+                        .await;
                     } else {
                         // 로그인 안 한 채 타임아웃 (주소만 알림)
                         let notice = format!("[Server] {} timed out (no login)", addr);

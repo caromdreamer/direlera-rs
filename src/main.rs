@@ -535,12 +535,16 @@ async fn main() -> color_eyre::Result<()> {
 
     let (tx, mut rx) = mpsc::channel::<Message>(100);
 
-    // Centralized AppState with RwLock for efficiency (shared by all sessions)
-    let global_state = Arc::new(AppState::new(tx.clone(), config.clone()));
-
     // Initialize Session Manager for TCP-like session handling
-    let (session_manager, packet_rx) = SessionManager::new();
+    let (session_manager, packet_rx, session_close_rx) = SessionManager::new();
     let session_manager = Arc::new(session_manager);
+
+    // Centralized AppState with RwLock for efficiency (shared by all sessions)
+    let global_state = Arc::new(AppState::new(
+        tx.clone(),
+        session_manager.session_close_sender(),
+        config.clone(),
+    ));
 
     // Start periodic session cleanup task
     session_manager
@@ -554,7 +558,9 @@ async fn main() -> color_eyre::Result<()> {
     let manager_for_run = session_manager.clone();
     let state_for_sessions = global_state.clone();
     tokio::spawn(async move {
-        manager_for_run.run(packet_rx, state_for_sessions).await;
+        manager_for_run
+            .run(packet_rx, session_close_rx, state_for_sessions)
+            .await;
     });
 
     tokio::spawn(master_list::run(global_state.clone()));

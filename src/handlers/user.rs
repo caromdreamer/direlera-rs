@@ -57,7 +57,7 @@ pub async fn handle_user_login(
         }
 
         // Stale session — evict and allow reconnect
-        if let Some((_, evicted)) = state.remove_client_by_username(&username).await {
+        if let Some((evicted_addr, evicted)) = state.remove_client_by_username(&username).await {
             info!(
                 "Evicting stale session for reconnecting user (old session at {})",
                 old_addr
@@ -68,6 +68,8 @@ pub async fn handle_user_login(
                 b"reconnected",
             );
             util::broadcast_packet(&state, msg::USER_QUIT, quit_data).await?;
+            // Also drop the old UDP session so it doesn't time out later.
+            state.close_session(&evicted_addr).await;
         }
     }
 
@@ -161,6 +163,9 @@ pub async fn handle_user_quit(
             String::from_utf8_lossy(&user_message)
         );
     }
+    // Tear down the UDP session now so the orphaned session task doesn't linger
+    // until SESSION_TIMEOUT and emit a spurious "timed out" notice.
+    state.close_session(src).await;
     util::record_processing_time("user_quit", start.elapsed());
     Ok(())
 }

@@ -28,6 +28,11 @@ pub struct AppState {
 
     pub tx: mpsc::Sender<crate::Message>,
 
+    /// Requests immediate teardown of a client's UDP session in the
+    /// SessionManager. Used on normal quit / stale eviction so the orphaned
+    /// session task doesn't linger until SESSION_TIMEOUT.
+    pub session_close_tx: mpsc::Sender<SocketAddr>,
+
     // Server configuration
     pub config: Arc<crate::Config>,
 
@@ -35,7 +40,11 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(tx: mpsc::Sender<crate::Message>, config: crate::Config) -> Self {
+    pub fn new(
+        tx: mpsc::Sender<crate::Message>,
+        session_close_tx: mpsc::Sender<SocketAddr>,
+        config: crate::Config,
+    ) -> Self {
         Self {
             clients_by_addr: Arc::new(RwLock::new(HashMap::new())),
             clients_by_id: Arc::new(RwLock::new(HashMap::new())),
@@ -43,9 +52,17 @@ impl AppState {
             next_game_id: Arc::new(AtomicU32::new(1)),
             next_user_id: Arc::new(AtomicU16::new(1)),
             tx,
+            session_close_tx,
             config: Arc::new(config),
             start_time: std::time::Instant::now(),
         }
+    }
+
+    /// Ask the SessionManager to tear down this address's session now.
+    /// Best-effort: a full channel or absent session is harmless (the session
+    /// would still expire via SESSION_TIMEOUT).
+    pub async fn close_session(&self, addr: &SocketAddr) {
+        let _ = self.session_close_tx.send(*addr).await;
     }
 
     // Lock-free ID generation
