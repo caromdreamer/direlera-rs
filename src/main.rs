@@ -658,6 +658,14 @@ async fn process_packet_in_session(
             // resend (acting directly on this signal) would be worth adding.
             if had_messages && processed == 0 {
                 metrics::counter!("inbound_zero_new_packets_total").increment(1);
+                // Stall detection #1 (pull / inbound): the client itself signaled a
+                // stall by re-sending an already-seen bundle. Logged so we can compare
+                // its timing against the 100ms server-side stall-resend push below.
+                info!(
+                    detector = "zero-new-inbound",
+                    expected_message_number = *packet_counter,
+                    "stall detected: client resent already-seen bundle"
+                );
             }
         }
         Err(e) => {

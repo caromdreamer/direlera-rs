@@ -198,7 +198,7 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
             let now = Instant::now();
 
             // Collect stalled players (with their game's metric labels) in playing games.
-            let stalled: Vec<(SocketAddr, Arc<crate::state::GameMetricLabels>)> = {
+            let stalled: Vec<(SocketAddr, Arc<crate::state::GameMetricLabels>, Duration)> = {
                 let game_ids: Vec<u32> =
                     { global_state.games.read().await.keys().copied().collect() };
                 let mut out = Vec::new();
@@ -209,8 +209,9 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                         }
                         for p in &game.players {
                             if let Some(last) = p.last_game_data_recv {
-                                if now.duration_since(last) >= STALL_THRESHOLD {
-                                    out.push((p.addr, game.metric_labels.clone()));
+                                let stalled_for = now.duration_since(last);
+                                if stalled_for >= STALL_THRESHOLD {
+                                    out.push((p.addr, game.metric_labels.clone(), stalled_for));
                                 }
                             }
                         }
@@ -223,7 +224,7 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
             metrics::gauge!("stalled_players").set(stalled.len() as f64);
 
             // Resend each stalled client's last packet verbatim (same msg numbers).
-            for (addr, labels) in stalled {
+            for (addr, labels, stalled_for) in stalled {
                 let last = {
                     let addr_map = global_state.clients_by_addr.read().await;
                     let id_map = global_state.clients_by_id.read().await;
@@ -234,6 +235,16 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                 };
                 if let Some(data) = last {
                     let _ = global_state.tx.send(crate::Message { data, addr }).await;
+                    // Stall detection #2 (push / outbound): the server noticed the client
+                    // stopped sending input for >=100ms and proactively resends its last
+                    // packet. Compare this timestamp against the zero-new-inbound log to
+                    // see which detector fires first.
+                    info!(
+                        detector = "stall-resend-push",
+                        { fields::ADDR } = %addr,
+                        stalled_ms = stalled_for.as_millis() as u64,
+                        "stall detected: resending last packet to stalled client"
+                    );
                     // game_name/emulator_name (not the per-instance game_uid) keep
                     // this counter's cardinality bounded by the real game catalog,
                     // so it needs no idle-expiry like the histogram series do.
