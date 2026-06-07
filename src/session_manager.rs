@@ -28,6 +28,18 @@ const CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
 const STALL_THRESHOLD: Duration = Duration::from_millis(100);
 const STALL_RESEND_INTERVAL: Duration = Duration::from_millis(50);
 
+/// During a PLAYING game a client streams input continuously, so going silent
+/// for this long means it's gone (process killed / hard crash) rather than a
+/// transient network stall. Reap it instead of waiting out the 120s keepalive —
+/// in lockstep a missing player freezes the game for everyone else.
+///
+/// Set well above any plausible network blip: until this fires, the stall-resend
+/// keeps poking the client every STALL_RESEND_INTERVAL, so a connection that
+/// recovers within the window catches up and the game continues. Past it, the
+/// player loses their slot (and, if they were the owner, the room closes). Only
+/// applies while playing; an idle client in the lobby keeps the full SESSION_TIMEOUT.
+const PLAYING_INPUT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Represents a single UDP "session" - simulating TCP connection
 struct UdpSession {
     last_seen: Instant,
@@ -238,11 +250,14 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
             tokio::time::sleep(STALL_RESEND_INTERVAL).await;
             let now = Instant::now();
 
-            // Collect stalled players (with their game's metric labels) in playing games.
-            let stalled: Vec<(SocketAddr, Arc<crate::state::GameMetricLabels>, Duration)> = {
+            // Collect, per playing game, players that stalled (need a resend) and
+            // players that have gone silent long enough to be considered gone (reap).
+            type StalledPlayer = (SocketAddr, Arc<crate::state::GameMetricLabels>, Duration);
+            let (stalled, dead): (Vec<StalledPlayer>, Vec<SocketAddr>) = {
                 let game_ids: Vec<u32> =
                     { global_state.games.read().await.keys().copied().collect() };
                 let mut out = Vec::new();
+                let mut dead = Vec::new();
                 for gid in game_ids {
                     if let Some(game) = global_state.get_game(gid).await {
                         if game.game_status != crate::state::GAME_STATUS_PLAYING {
@@ -262,14 +277,17 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                             }
                             if let Some(last) = p.last_game_data_recv {
                                 let stalled_for = now.duration_since(last);
-                                if stalled_for >= STALL_THRESHOLD {
+                                if stalled_for >= PLAYING_INPUT_TIMEOUT {
+                                    // Gone, not merely stalled: reap instead of resending.
+                                    dead.push(p.addr);
+                                } else if stalled_for >= STALL_THRESHOLD {
                                     out.push((p.addr, game.metric_labels.clone(), stalled_for));
                                 }
                             }
                         }
                     }
                 }
-                out
+                (out, dead)
             };
 
             // How many players are stalled right now (across all playing games).
@@ -307,6 +325,21 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                     )
                     .increment(1);
                 }
+            }
+
+            // Reap players that have sent no input for PLAYING_INPUT_TIMEOUT: in a
+            // lockstep game this is a dead client (process killed), not a stall, and
+            // it freezes the game for everyone else until the 120s keepalive fires.
+            // Request session teardown; the session task's graceful close runs the
+            // full quit flow (closes the game if this was the owner, releases the
+            // co-players). Idempotent — a duplicate close before teardown is a no-op.
+            for addr in dead {
+                warn!(
+                    { fields::ADDR } = %addr,
+                    timeout = ?PLAYING_INPUT_TIMEOUT,
+                    "Playing client sent no game input past timeout; requesting session teardown"
+                );
+                let _ = global_state.session_close_tx.send(addr).await;
             }
         }
     });
