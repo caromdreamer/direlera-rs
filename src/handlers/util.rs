@@ -516,8 +516,7 @@ pub async fn make_server_information(
 ) -> color_eyre::Result<Vec<Vec<u8>>> {
     // The Kaillera client renders each SERVER_INFORMATION message as a single
     // chat line and truncates anything after the first embedded newline. So a
-    // multi-line welcome message must be sent as one packet *per line* (this is
-    // what EmuLinker-K does: one InfoMessageEvent per login message line).
+    // multi-line welcome message must be sent as one packet *per line*.
     // '            NB : "Server\0"
     // '            NB : Message
 
