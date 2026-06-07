@@ -405,8 +405,11 @@ pub async fn handle_quit_game(
     // exists). Kaillera has no owner-change packet, so use a server game-chat line.
     if let Some(owner_name) = new_owner {
         if state.get_game(game_id).await.is_some() {
-            let text = format!("{} is now the room host", util::bytes_for_log(&owner_name));
-            let chat = packet_util::build_game_chat_packet(b"Server", text.as_bytes());
+            // Concatenate raw bytes so the name keeps its original encoding
+            // (EUC-KR etc.); ASCII suffix is a subset, so the line renders cleanly.
+            let mut text = owner_name.clone();
+            text.extend_from_slice(b" is now the room host");
+            let chat = packet_util::build_game_chat_packet(b"Server", &text);
             util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, chat).await?;
         }
     }
