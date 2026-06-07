@@ -248,7 +248,18 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                         if game.game_status != crate::state::GAME_STATUS_PLAYING {
                             continue;
                         }
-                        for p in &game.players {
+                        for (player_id, p) in game.players.iter().enumerate() {
+                            // The game stays PLAYING until the last player leaves, so a
+                            // player who already dropped is still listed here with a stale
+                            // last_game_data_recv. They aren't waiting on input — resending
+                            // to them is wasted work and floods the log until they fully quit.
+                            if game
+                                .sync_manager
+                                .as_ref()
+                                .is_some_and(|m| m.is_player_dropped(player_id))
+                            {
+                                continue;
+                            }
                             if let Some(last) = p.last_game_data_recv {
                                 let stalled_for = now.duration_since(last);
                                 if stalled_for >= STALL_THRESHOLD {

@@ -262,7 +262,8 @@ pub async fn handle_quit_game(
     let client_info = match state.get_client(src).await {
         Some(client_info) => client_info,
         None => {
-            error!("Client not found during game quit");
+            // Benign teardown race: the session was already cleaned up.
+            debug!("Quit game ignored: client not found (post-teardown race)");
             return Ok(());
         }
     };
@@ -270,7 +271,9 @@ pub async fn handle_quit_game(
     let game_id = match client_info.game_id {
         Some(game_id) => game_id,
         None => {
-            error!("Game ID not found during game quit");
+            // Benign teardown race: the game was already closed (e.g. the owner
+            // quit first) before this client's quit arrived.
+            debug!("Quit game ignored: client no longer in a game (post-teardown race)");
             return Ok(());
         }
     };
