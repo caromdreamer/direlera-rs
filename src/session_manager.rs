@@ -13,6 +13,13 @@ use crate::{fields, packet_util, AppState};
 
 /// Configuration for session timeout behavior
 const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
+/// Grace period for a session that has not yet logged in. Any game-port packet
+/// from a new addr spawns a session so the stateful login handshake (USER_LOGIN
+/// -> ACK round trips) has somewhere to run, but a connection that never
+/// completes login (server-browser probes, stray/out-of-sequence packets,
+/// rejected logins) is not a real user. It's reaped quickly and silently instead
+/// of squatting a full SESSION_TIMEOUT and emitting a spurious lobby notice.
+const PRE_LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
 
 /// Stall recovery: if a playing client hasn't sent game input for this long, it
@@ -328,7 +335,14 @@ async fn handle_session(
 
         // Session loop - similar to TCP recv loop
         loop {
-            match timeout(SESSION_TIMEOUT, rx.recv()).await {
+            // A session that hasn't logged in yet (no cached identity) only gets a
+            // short grace window; once logged in it gets the full keepalive timeout.
+            let recv_timeout = if cached_identity.is_some() {
+                SESSION_TIMEOUT
+            } else {
+                PRE_LOGIN_TIMEOUT
+            };
+            match timeout(recv_timeout, rx.recv()).await {
                 Ok(Some(data)) => {
                     // Update last_seen
                     {
@@ -385,7 +399,7 @@ async fn handle_session(
                     break;
                 }
                 Err(_) => {
-                    warn!(timeout_duration = ?SESSION_TIMEOUT, "Session timeout");
+                    warn!(timeout_duration = ?recv_timeout, "Session timeout");
                     use crate::kaillera::message_types as msg;
                     if let Some(client_info) = global_state.get_client(&addr).await {
                         let username = crate::handlers::util::bytes_for_log(&client_info.username);
@@ -441,16 +455,13 @@ async fn handle_session(
                         )
                         .await;
                     } else {
-                        // 로그인 안 한 채 타임아웃 (주소만 알림)
-                        let notice = format!("[Server] {} timed out (no login)", addr);
-                        let data =
-                            packet_util::build_global_chat_packet(b"Server", notice.as_bytes());
-                        let _ = crate::handlers::util::broadcast_packet(
-                            &global_state,
-                            msg::GLOBAL_CHAT,
-                            data,
-                        )
-                        .await;
+                        // Never logged in (server-browser probe, stray/out-of-sequence
+                        // packet, rejected login): not a real user, so reap silently
+                        // without spamming the lobby. Just log it for diagnostics.
+                        info!(
+                            { fields::ADDR } = %addr,
+                            "Pre-login session reaped (no login); no lobby notice"
+                        );
                     }
                     break;
                 }
