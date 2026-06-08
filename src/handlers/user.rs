@@ -53,6 +53,25 @@ pub async fn handle_user_login(
                 "Login rejected: username already in use by active session at {}",
                 old_addr
             );
+            // Tell the client explicitly with CONNECTION_REJECTED (0x16) instead of
+            // dropping silently (which the client can't distinguish from a network
+            // failure — it just times out). This is the first and only server reply
+            // to the not-yet-registered login attempt, so build it with a fresh
+            // generator (sequence starts at 0, like the normal ACK would).
+            let mut gen = kaillera::protocol::UDPPacketGenerator::new();
+            let body = packet_util::build_connection_rejected_packet(
+                b"server",
+                0,
+                b"Username is already in use.",
+            );
+            let datagram = gen.make_send_packet(msg::CONNECTION_REJECTED, body);
+            let _ = state
+                .tx
+                .send(crate::Message {
+                    data: datagram,
+                    addr: *src,
+                })
+                .await;
             return Ok(());
         }
 

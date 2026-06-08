@@ -175,6 +175,15 @@ pub fn build_quit_game_packet(username: &[u8], user_id: u16) -> Vec<u8> {
 
 /// Builds a CLOSE_GAME packet
 /// Format: Empty String [00], GameID (4B)
+/// 0x16 Connection Rejected body: username (sender) + UserID (2B LE) + message.
+pub fn build_connection_rejected_packet(username: &[u8], user_id: u16, message: &[u8]) -> Vec<u8> {
+    let mut data = BytesMut::new();
+    put_bytes_with_null(&mut data, username);
+    data.put_u16_le(user_id);
+    put_bytes_with_null(&mut data, message);
+    data.to_vec()
+}
+
 pub fn build_close_game_packet(game_id: u32) -> Vec<u8> {
     let mut data = BytesMut::new();
     put_empty_string(&mut data);
