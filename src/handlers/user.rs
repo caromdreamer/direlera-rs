@@ -56,6 +56,18 @@ pub async fn handle_user_login(
             return Ok(());
         }
 
+        // Tear down any game the stale session was in BEFORE removing its client.
+        // remove_client_by_username only drops the client maps — it doesn't touch
+        // games — so without this an owned, still-playing game would be orphaned
+        // into a ghost room (listed as playing with no live members). Running the
+        // normal quit flow here closes the game (or migrates ownership if other
+        // players remain). Must run while the old client is still in global state,
+        // since handle_quit_game looks it up by address.
+        if old_client.game_id.is_some() {
+            let _ =
+                crate::handlers::game::handle_quit_game(Vec::new(), &old_addr, state.clone()).await;
+        }
+
         // Stale session — evict and allow reconnect
         if let Some((evicted_addr, evicted)) = state.remove_client_by_username(&username).await {
             info!(
