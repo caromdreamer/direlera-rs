@@ -865,20 +865,43 @@ pub async fn handle_kick_user(
         }
     };
 
-    let game_info_clone = {
-        let game_arc = match state.get_game_arc(game_id).await {
-            Some(arc) => arc,
-            None => {
-                error!("Game not found during kick user");
-                return Ok(());
-            }
-        };
-        let mut game_info = game_arc.lock().await;
-        if let Some(idx) = game_info.players.iter().position(|p| p.addr == client_addr) {
-            game_info.players.remove(idx);
-            game_info.num_players -= 1;
+    let game_arc = match state.get_game_arc(game_id).await {
+        Some(arc) => arc,
+        None => {
+            debug!("Kick ignored: game already gone (post-teardown race)");
+            return Ok(());
         }
-        game_info.clone()
+    };
+
+    // Return the kicked client to the lobby.
+    let _ = util::with_client_mut(&state, &client_addr, |client_info| {
+        client_info.game_id = None;
+        client_info.player_status = PLAYER_STATUS_IDLE;
+        client_info.session_span.record("game_id", 0u32);
+    })
+    .await;
+
+    // Same invariant as quit: the players Vec is the lockstep sync-slot index, so
+    // don't reindex it while a game is live — tombstone + sync-drop instead, and
+    // compact at game end.
+    let was_playing = {
+        let mut game_info = game_arc.lock().await;
+        let idx = game_info.players.iter().position(|p| p.addr == client_addr);
+        if game_info.sync_manager.is_some() {
+            if let Some(i) = idx {
+                game_info.players[i].left_room = true;
+            }
+            game_info.num_players = game_info.players.iter().filter(|p| !p.left_room).count() as u8;
+            migrate_owner_if_needed(&mut game_info);
+            true
+        } else {
+            if let Some(i) = idx {
+                game_info.players.remove(i);
+            }
+            game_info.num_players = game_info.players.len() as u8;
+            migrate_owner_if_needed(&mut game_info);
+            false
+        }
     };
 
     info!(
@@ -887,13 +910,21 @@ pub async fn handle_kick_user(
         client_user_id
     );
 
-    // Update game status
-    let status_data = util::make_update_game_status(&game_info_clone)?;
-    util::broadcast_packet(&state, msg::UPDATE_GAME_STATUS, status_data).await?;
+    if was_playing {
+        // Drop the kicked player's slot so the rest keep playing (compaction/close
+        // happens at game end).
+        let _ = execute_drop_game(game_id, &client_addr, &state).await;
+    }
 
-    // Quit game notification
-    let data = packet_util::build_quit_game_packet(&username, client_user_id);
-    util::broadcast_packet_to_game(&state, game_id, msg::QUIT_GAME, data).await?;
+    // Notify the kicked player directly (they're no longer in the room broadcast set)
+    // and the remaining room members.
+    let quit_data = packet_util::build_quit_game_packet(&username, client_user_id);
+    util::send_packet(&state, &client_addr, msg::QUIT_GAME, quit_data.clone()).await?;
+    if let Some(game_info) = state.get_game(game_id).await {
+        util::broadcast_packet_to_game(&state, game_id, msg::QUIT_GAME, quit_data).await?;
+        let status_data = util::make_update_game_status(&game_info)?;
+        util::broadcast_packet(&state, msg::UPDATE_GAME_STATUS, status_data).await?;
+    }
     util::record_processing_time("kick_user", start.elapsed());
     Ok(())
 }
