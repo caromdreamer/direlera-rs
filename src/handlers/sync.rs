@@ -274,12 +274,19 @@ pub async fn handle_ready_to_play_signal(
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = buf.get_u8(); // Empty String
 
-    state
+    let already_playing = state
         .update_client(src, |client_info| {
-            client_info.player_status = PLAYER_STATUS_NET_SYNC; // Ready to play
-            Ok(())
+            let already_playing = client_info.player_status == PLAYER_STATUS_PLAYING;
+            if !already_playing {
+                client_info.player_status = PLAYER_STATUS_NET_SYNC; // Ready to play
+            }
+            Ok(already_playing)
         })
         .await?;
+    if already_playing {
+        debug!("Ready to play ignored: player is already playing");
+        return Ok(());
+    }
 
     let game_info_clone = util::fetch_game_info(src, &state).await?;
 

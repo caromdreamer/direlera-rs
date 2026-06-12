@@ -7,6 +7,15 @@ control_port = 27888
 # Latency is unaffected (same packet cadence, larger payload).
 disable_output_cache = false
 
+# Optional fixed game delay override in frames. Uncomment for local real-client
+# testing when you want to ignore measured ping and force a specific delay for
+# every player. `0` disables the warmup/delay layer.
+# fixed_game_delay = 6
+
+# When false (default), each player receives their own ping-derived delay.
+# When true, every player receives the highest ping-derived delay in the room.
+same_game_delay = false
+
 # Welcome message shown to clients when they connect.
 # Each line is sent as a separate message, so you can use multiple lines.
 welcome_message = """

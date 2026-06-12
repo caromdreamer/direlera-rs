@@ -1,7 +1,7 @@
 // Session-based UDP handling - TCP-like session management for UDP
 // Each client gets its own session handler, similar to TCP connections
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -370,6 +370,7 @@ async fn handle_session(
 
         // Per-session packet counter — no global lock needed
         let mut packet_counter: u16 = 0;
+        let mut pending_messages = BTreeMap::new();
 
         // Last-known identity (log-friendly name + user_id), cached once the
         // client logs in. If the client is already gone from global state by the
@@ -402,6 +403,7 @@ async fn handle_session(
                         addr,
                         global_state.clone(),
                         &mut packet_counter,
+                        &mut pending_messages,
                     )
                     .await;
 

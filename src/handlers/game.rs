@@ -511,21 +511,66 @@ pub async fn handle_start_game(
 
     let disable_output_cache = state.config.disable_output_cache;
 
+    // Size one delay value per player. In this simple model, the advertised
+    // delay is also the initial zero-response count and the steady server-side
+    // input delay: D=2 means two zero replies, then two-frame-old input.
+    let (advertised_delays, sync_delays) = if let Some(delay) = state.config.fixed_game_delay {
+        let d = delay as usize;
+        info!(total_delay = d, "Using fixed game delay override");
+        if d == 0 {
+            // Keep legacy START_GAME delay values for clients, but disable the
+            // server warmup/delay layer for local comparison tests.
+            (delays.clone(), vec![0; players.len()])
+        } else {
+            (vec![d; players.len()], vec![d; players.len()])
+        }
+    } else {
+        const GAME_FPS: f64 = 60.0;
+        let mut player_frame_delays = Vec::with_capacity(players.len());
+        for p in &players {
+            let ping_ms = state.get_client(&p.addr).await.map(|c| c.ping).unwrap_or(0);
+            let conn = (p.conn_type as f64).max(1.0);
+            // Round up to the next whole frame, then add one frame of jitter
+            // headroom. The old floor(+1) sizing made borderline RTTs (e.g.
+            // ~17ms at 60fps) advertise delay=2, leaving no room for scheduler
+            // or UDP dispatch variance and causing visible FPS collapse.
+            let frame_delay = (GAME_FPS / conn * (ping_ms as f64 / 1000.0)).ceil() as usize + 1;
+            player_frame_delays.push(frame_delay);
+        }
+        let highest_delay = player_frame_delays.iter().copied().max().unwrap_or(1);
+        let advertised_delays = if state.config.same_game_delay {
+            vec![highest_delay; players.len()]
+        } else {
+            player_frame_delays
+        };
+        let sync_delays = advertised_delays.clone();
+        info!(
+            same_game_delay = state.config.same_game_delay,
+            advertised_delays = ?advertised_delays,
+            sync_delays = ?sync_delays,
+            "Sized per-player delays from ping"
+        );
+        (advertised_delays, sync_delays)
+    };
+
     // Initialize SimpleGameSync when game starts
     util::with_game_mut(&state, src, |game_info| {
         game_info.game_status = GAME_STATUS_PLAYING;
-        // total_delay = 0 for now (transparent passthrough — no behavior change).
-        // The RTT-based delay buffer + warmup gets wired in a follow-up.
         let combiner = simplest_game_sync::CachedGameSync::new(delays.clone())
             .with_output_cache_disabled(disable_output_cache);
-        game_info.sync_manager = Some(simplest_game_sync::DelayedGameSync::new(combiner, 0));
+        game_info.sync_manager = Some(simplest_game_sync::DelayedGameSync::with_player_delays(
+            combiner,
+            sync_delays.clone(),
+        ));
     })
     .await?;
 
-    // Update all players' status to NET_SYNC when game starts
+    // Game has been announced, but clients are not ready until they send 0x15.
+    // `READY_TO_PLAY` marks each player NET_SYNC; once all are NET_SYNC the server
+    // broadcasts the all-ready notification and marks them PLAYING.
     for player in &players {
         util::with_client_mut(&state, &player.addr, |client_info| {
-            client_info.player_status = PLAYER_STATUS_NET_SYNC;
+            client_info.player_status = PLAYER_STATUS_IDLE;
         })
         .await?;
     }
@@ -551,9 +596,11 @@ pub async fn handle_start_game(
     //     }
     // }
 
-    // Send start game notification with each player's delay
     for (i, player) in game_info.players.iter().enumerate() {
-        let player_delay = player.conn_type as usize;
+        let player_delay = advertised_delays
+            .get(i)
+            .copied()
+            .unwrap_or(player.conn_type as usize);
         let player_number = (i + 1) as u8;
         let total_players = game_info.players.len() as u8;
         debug!(
@@ -564,6 +611,17 @@ pub async fn handle_start_game(
             packet_util::build_start_game_packet(player_delay as u16, player_number, total_players);
         util::send_packet(&state, &player.addr, msg::START_GAME, data).await?;
     }
+
+    let text = advertised_delays
+        .iter()
+        .enumerate()
+        .map(|(i, delay)| format!("P{}={}", i + 1, delay))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let text = format!("Game delays: {}", text);
+    let chat = packet_util::build_game_chat_packet(b"Server", text.as_bytes());
+    util::broadcast_packet_to_game(&state, game_id, msg::GAME_CHAT, chat).await?;
+
     util::record_processing_time("start_game", start.elapsed());
     Ok(())
 }

@@ -1,6 +1,7 @@
 use direlera_rs::logger::{init_logger, LogFormat, LogLevel, LokiConfig};
 use packet_util::*;
 use serde::Deserialize;
+use std::collections::BTreeMap;
 use std::fs;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -21,6 +22,8 @@ mod session_manager;
 mod simplest_game_sync;
 use session_manager::SessionManager;
 use state::*;
+
+const MAX_PENDING_SESSION_MESSAGES: usize = 256;
 
 // Configuration structures
 #[derive(Debug, Deserialize, Clone)]
@@ -68,6 +71,16 @@ pub struct Config {
     /// unaffected (same packet cadence, larger payload). Default false.
     #[serde(default)]
     pub disable_output_cache: bool,
+    /// Optional fixed game delay override in frames. When set, this takes
+    /// precedence over ping-based sizing and sends the same delay to every player.
+    /// Useful for local real-client testing. `0` disables the warmup/delay layer.
+    /// When omitted, the server always sizes delay from measured login RTT.
+    #[serde(default)]
+    pub fixed_game_delay: Option<u16>,
+    /// When true, every player receives the highest ping-derived delay. When false
+    /// (default), each player receives their own ping-derived delay.
+    #[serde(default)]
+    pub same_game_delay: bool,
     /// When true, push logs to a Loki endpoint (in addition to stdout). Designed,
     /// like metrics push, for servers a central collector cannot reach to scrape.
     #[serde(default)]
@@ -100,6 +113,8 @@ impl Default for Config {
             metrics_push_username: String::new(),
             metrics_push_password: String::new(),
             disable_output_cache: false,
+            fixed_game_delay: None,
+            same_game_delay: false,
             logs_push_enabled: false,
             logs_push_url: String::new(),
             logs_push_username: String::new(),
@@ -644,6 +659,7 @@ async fn process_packet_in_session(
     addr: std::net::SocketAddr,
     global_state: Arc<AppState>,
     packet_counter: &mut u16,
+    pending_messages: &mut BTreeMap<u16, kaillera::protocol::ParsedMessage>,
 ) {
     // This fn runs inside the session span (see handle_session .instrument(span)),
     // so the current span here is that long-lived session span.
@@ -654,33 +670,39 @@ async fn process_packet_in_session(
                 // Message number 0 signals the start of a new sequence
                 if message.message_number == 0 && messages.len() == 1 {
                     *packet_counter = 0;
+                    pending_messages.clear();
                 }
             }
 
             let had_messages = !messages.is_empty();
             let mut processed = 0u32;
             for message in messages {
-                let message_number_to_process = *packet_counter;
+                if message.message_number == *packet_counter {
+                    processed += process_ordered_message(
+                        message,
+                        addr,
+                        global_state.clone(),
+                        session_span.clone(),
+                        packet_counter,
+                    )
+                    .await;
 
-                if message.message_number == message_number_to_process {
-                    *packet_counter = message_number_to_process + 1;
-                    processed += 1;
-
-                    let msg_number = message.message_number;
-                    let msg_type = message.message_type;
-
-                    if let Err(e) =
-                        handle_message(message, &addr, global_state.clone(), session_span.clone())
-                            .await
-                    {
-                        error!(
-                            { fields::MESSAGE_NUMBER } = msg_number,
-                            { fields::MESSAGE_TYPE } = format!("0x{:02X}", msg_type),
-                            error = ?e,
-                            error_chain = %e,
-                            "Failed to handle message"
-                        );
+                    while let Some(message) = pending_messages.remove(packet_counter) {
+                        processed += process_ordered_message(
+                            message,
+                            addr,
+                            global_state.clone(),
+                            session_span.clone(),
+                            packet_counter,
+                        )
+                        .await;
                     }
+                } else if is_future_message(message.message_number, *packet_counter)
+                    && pending_messages.len() < MAX_PENDING_SESSION_MESSAGES
+                {
+                    pending_messages
+                        .entry(message.message_number)
+                        .or_insert(message);
                 }
             }
 
@@ -716,4 +738,34 @@ async fn process_packet_in_session(
             );
         }
     }
+}
+
+fn is_future_message(message_number: u16, expected: u16) -> bool {
+    let distance = message_number.wrapping_sub(expected);
+    distance != 0 && distance < (u16::MAX / 2)
+}
+
+async fn process_ordered_message(
+    message: kaillera::protocol::ParsedMessage,
+    addr: std::net::SocketAddr,
+    global_state: Arc<AppState>,
+    session_span: tracing::Span,
+    packet_counter: &mut u16,
+) -> u32 {
+    *packet_counter = packet_counter.wrapping_add(1);
+
+    let msg_number = message.message_number;
+    let msg_type = message.message_type;
+
+    if let Err(e) = handle_message(message, &addr, global_state, session_span).await {
+        error!(
+            { fields::MESSAGE_NUMBER } = msg_number,
+            { fields::MESSAGE_TYPE } = format!("0x{:02X}", msg_type),
+            error = ?e,
+            error_chain = %e,
+            "Failed to handle message"
+        );
+    }
+
+    1
 }
