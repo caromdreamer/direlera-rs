@@ -77,10 +77,24 @@ pub struct Config {
     /// When omitted, the server always sizes delay from measured login RTT.
     #[serde(default)]
     pub fixed_game_delay: Option<u16>,
-    /// When true, every player receives the highest ping-derived delay. When false
-    /// (default), each player receives their own ping-derived delay.
+    /// When true, every player's input is delayed by the highest ping-derived
+    /// delay. When false (default), each player keeps their own ping-derived
+    /// input delay.
     #[serde(default)]
     pub same_game_delay: bool,
+    /// When true, START_GAME advertises the highest ping-derived delay to every
+    /// player as the client send window, while `same_game_delay = false` can
+    /// still keep fast players on lower server-side input delay.
+    #[serde(default = "default_shared_game_delay_window")]
+    pub shared_game_delay_window: bool,
+    /// Safety margin added only to the shared START_GAME send window. This gives
+    /// the client pipeline enough room for scheduling variance without changing
+    /// per-player server-side input delay.
+    #[serde(
+        default = "default_delay_window_margin_frames",
+        alias = "shared_game_delay_window_extra_frames"
+    )]
+    pub shared_game_delay_window_margin_frames: u16,
     /// When true, push logs to a Loki endpoint (in addition to stdout). Designed,
     /// like metrics push, for servers a central collector cannot reach to scrape.
     #[serde(default)]
@@ -115,6 +129,8 @@ impl Default for Config {
             disable_output_cache: false,
             fixed_game_delay: None,
             same_game_delay: false,
+            shared_game_delay_window: default_shared_game_delay_window(),
+            shared_game_delay_window_margin_frames: default_delay_window_margin_frames(),
             logs_push_enabled: false,
             logs_push_url: String::new(),
             logs_push_username: String::new(),
@@ -255,6 +271,14 @@ fn default_metrics_port() -> u16 {
 
 fn default_metrics_push_interval() -> u64 {
     15
+}
+
+fn default_shared_game_delay_window() -> bool {
+    true
+}
+
+fn default_delay_window_margin_frames() -> u16 {
+    2
 }
 
 fn default_main_port() -> u16 {

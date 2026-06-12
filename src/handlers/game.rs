@@ -9,6 +9,9 @@ use crate::kaillera::message_types as msg;
 use crate::simplest_game_sync;
 use crate::*;
 
+const GAME_FPS: f64 = 60.0;
+const MIN_AUTO_GAME_DELAY_FRAMES: usize = 1;
+
 // Refactored handle_create_game function
 #[tracing::instrument(skip_all)]
 pub async fn handle_create_game(
@@ -525,27 +528,29 @@ pub async fn handle_start_game(
             (vec![d; players.len()], vec![d; players.len()])
         }
     } else {
-        const GAME_FPS: f64 = 60.0;
         let mut player_frame_delays = Vec::with_capacity(players.len());
         for p in &players {
             let ping_ms = state.get_client(&p.addr).await.map(|c| c.ping).unwrap_or(0);
-            let conn = (p.conn_type as f64).max(1.0);
-            // Round up to the next whole frame, then add one frame of jitter
-            // headroom. The old floor(+1) sizing made borderline RTTs (e.g.
-            // ~17ms at 60fps) advertise delay=2, leaving no room for scheduler
-            // or UDP dispatch variance and causing visible FPS collapse.
-            let frame_delay = (GAME_FPS / conn * (ping_ms as f64 / 1000.0)).ceil() as usize + 1;
-            player_frame_delays.push(frame_delay);
+            player_frame_delays.push(auto_game_delay_frames(ping_ms, p.conn_type));
         }
         let highest_delay = player_frame_delays.iter().copied().max().unwrap_or(1);
-        let advertised_delays = if state.config.same_game_delay {
+        let sync_delays = if state.config.same_game_delay {
             vec![highest_delay; players.len()]
         } else {
-            player_frame_delays
+            player_frame_delays.clone()
         };
-        let sync_delays = advertised_delays.clone();
+        let shared_window_delay =
+            highest_delay + state.config.shared_game_delay_window_margin_frames as usize;
+        let advertised_delays =
+            if state.config.same_game_delay || state.config.shared_game_delay_window {
+                vec![shared_window_delay; players.len()]
+            } else {
+                player_frame_delays
+            };
         info!(
             same_game_delay = state.config.same_game_delay,
+            shared_game_delay_window = state.config.shared_game_delay_window,
+            shared_game_delay_window_margin_frames = state.config.shared_game_delay_window_margin_frames,
             advertised_delays = ?advertised_delays,
             sync_delays = ?sync_delays,
             "Sized per-player delays from ping"
@@ -624,6 +629,12 @@ pub async fn handle_start_game(
 
     util::record_processing_time("start_game", start.elapsed());
     Ok(())
+}
+
+fn auto_game_delay_frames(ping_ms: u32, conn_type: u8) -> usize {
+    let conn = (conn_type as f64).max(1.0);
+    let frames = (GAME_FPS / conn * (ping_ms as f64 / 1000.0)).floor() as usize + 1;
+    frames.max(MIN_AUTO_GAME_DELAY_FRAMES)
 }
 
 /*
@@ -985,4 +996,29 @@ pub async fn handle_kick_user(
     }
     util::record_processing_time("kick_user", start.elapsed());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::auto_game_delay_frames;
+
+    #[test]
+    fn auto_game_delay_allows_one_frame_floor_for_zero_ping() {
+        assert_eq!(auto_game_delay_frames(0, 1), 1);
+        assert_eq!(auto_game_delay_frames(1, 1), 1);
+        assert_eq!(auto_game_delay_frames(16, 1), 1);
+    }
+
+    #[test]
+    fn auto_game_delay_advances_after_frame_boundary() {
+        assert_eq!(auto_game_delay_frames(17, 1), 2);
+        assert_eq!(auto_game_delay_frames(50, 1), 4);
+        assert_eq!(auto_game_delay_frames(68, 1), 5);
+    }
+
+    #[test]
+    fn auto_game_delay_respects_connection_type_cadence() {
+        assert_eq!(auto_game_delay_frames(68, 2), 3);
+        assert_eq!(auto_game_delay_frames(68, 3), 2);
+    }
 }

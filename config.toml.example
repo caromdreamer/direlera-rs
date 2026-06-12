@@ -12,9 +12,20 @@ disable_output_cache = false
 # every player. `0` disables the warmup/delay layer.
 # fixed_game_delay = 6
 
-# When false (default), each player receives their own ping-derived delay.
-# When true, every player receives the highest ping-derived delay in the room.
+# When false (default), each player keeps their own ping-derived server-side
+# input delay. When true, every player gets the highest ping-derived input delay.
 same_game_delay = false
+
+# When true (default), START_GAME advertises the highest ping-derived delay to
+# every player as the client send window. This lets fast clients keep sending
+# while waiting for a slower peer, without forcing their server-side input delay
+# to the slowest player's value.
+shared_game_delay_window = true
+
+# Safety margin added only to the shared START_GAME send window. This does not
+# change server-side input delay. Use 0 for strict/lowest advertised delay, 1 for
+# light LAN margin, 2 as the recommended default, 3+ for jittery links.
+shared_game_delay_window_margin_frames = 2
 
 # Welcome message shown to clients when they connect.
 # Each line is sent as a separate message, so you can use multiple lines.
