@@ -554,6 +554,146 @@ impl CachedGameSync {
     }
 }
 
+/// L1: per-player warmup + fixed-delay buffer placed in FRONT of the combiner.
+///
+/// Pipeline order (the GameCache hazard below is why this ordering matters):
+///   input-cache resolve (here) -> delay FIFO (here) -> combine + output-cache (`inner`)
+///
+/// Every player's input is held back by `total_delay` (D) frames so the lockstep
+/// combiner always works on inputs that are D frames old, giving each input D
+/// frame-times of network travel budget (delay-based netcode; the caller sizes D
+/// from measured RTT). The initial warmup feeds the client `total_delay` zero
+/// frames so a conn=1 client (which has only ~1 frame of its own lookahead) can keep
+/// advancing and prime the pipe instead of deadlocking.
+///
+/// GameCache references are resolved to bytes HERE, up front, and only resolved
+/// bytes are stored in the FIFO. Resolving a *delayed* GameCache reference later (at
+/// drain time) would read a client cache whose contents have since shifted -> silent
+/// desync. So resolution must precede the delay.
+///
+/// Steady state keeps a constant-depth-D server-side FIFO (push 1 / pop the D-old
+/// one per input). This intentionally differs from EmuLinker, which drains its stash
+/// to empty then runs realtime (the D-ahead offset then living on the client). A
+/// server-held buffer is more robust when clients are forced to conn=1 and drops no
+/// inputs.
+///
+/// `total_delay == 0` is a transparent passthrough (push then immediately pop the
+/// same input), so this layer can be inserted with D=0 before RTT-based D is wired.
+#[derive(Debug, Clone)]
+pub struct DelayedGameSync {
+    inner: CachedGameSync,
+    /// Per-player client-input cache, for resolving incoming GameCache references.
+    input_caches: Vec<InputCache>,
+    /// Per-player FIFO of resolved input bytes awaiting release to the combiner.
+    queues: Vec<VecDeque<Vec<u8>>>,
+    /// Per-player count of warmup zero-frames already emitted.
+    warmup_sent: Vec<usize>,
+    /// Fixed delay D (frames) applied to every player.
+    total_delay: usize,
+    /// One player's per-frame input size, learned from the first input (zero sizing).
+    /// Assumes conn=1 (one frame per packet); revisit for batched conn types.
+    frame_size: usize,
+    player_count: usize,
+}
+
+impl DelayedGameSync {
+    /// Wrap a combiner with a D-frame warmup/delay buffer.
+    pub fn new(inner: CachedGameSync, total_delay: usize) -> Self {
+        let player_count = inner.player_count();
+        Self {
+            input_caches: (0..player_count).map(|_| InputCache::new()).collect(),
+            queues: (0..player_count).map(|_| VecDeque::new()).collect(),
+            warmup_sent: vec![0; player_count],
+            total_delay,
+            frame_size: 0,
+            player_count,
+            inner,
+        }
+    }
+
+    pub fn process_client_input(
+        &mut self,
+        player_id: usize,
+        input: ClientInput,
+    ) -> Result<(Vec<CachedPlayerOutput>, bool, Option<usize>), GameSyncError> {
+        if player_id >= self.player_count {
+            return Err(GameSyncError::InvalidPlayerId {
+                player_id,
+                player_count: self.player_count,
+            });
+        }
+
+        // L0: resolve to raw bytes (and mirror the client's input cache so future
+        // GameCache references from this client resolve correctly).
+        let bytes = match input {
+            ClientInput::GameData(d) => {
+                self.input_caches[player_id].push(d.clone());
+                d
+            }
+            ClientInput::GameCache(pos) => self.input_caches[player_id]
+                .get(pos)
+                .ok_or(GameSyncError::CachePositionNotFound {
+                    player_id,
+                    position: pos,
+                })?
+                .to_vec(),
+        };
+
+        if self.frame_size == 0 && !bytes.is_empty() {
+            self.frame_size = bytes.len();
+        }
+
+        // L1: enqueue resolved bytes.
+        self.queues[player_id].push_back(bytes);
+
+        // Warmup: feed this client a zero combined-frame and hold the real input,
+        // until D frames are buffered.
+        if self.warmup_sent[player_id] < self.total_delay {
+            self.warmup_sent[player_id] += 1;
+            let zero = vec![0u8; self.player_count * self.frame_size];
+            return Ok((
+                vec![CachedPlayerOutput {
+                    player_id,
+                    response: ServerResponse::GameData(zero),
+                }],
+                false,
+                None,
+            ));
+        }
+
+        // Steady state: release the D-frames-old input into the combiner. The queue
+        // holds at least the input just pushed, so this never underflows.
+        let due = self.queues[player_id]
+            .pop_front()
+            .expect("queue holds at least the just-pushed input");
+        self.inner
+            .process_client_input(player_id, ClientInput::GameData(due))
+    }
+
+    pub fn mark_player_dropped(
+        &mut self,
+        player_id: usize,
+    ) -> Result<Vec<CachedPlayerOutput>, GameSyncError> {
+        // A dropped player's buffered (delayed) inputs are moot; discard them.
+        if player_id < self.player_count {
+            self.queues[player_id].clear();
+        }
+        self.inner.mark_player_dropped(player_id)
+    }
+
+    pub fn is_player_dropped(&self, player_id: usize) -> bool {
+        self.inner.is_player_dropped(player_id)
+    }
+
+    pub fn player_count(&self) -> usize {
+        self.player_count
+    }
+
+    pub fn get_player_delay(&self, player_id: usize) -> usize {
+        self.inner.get_player_delay(player_id)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1145,5 +1285,76 @@ mod tests {
         assert_eq!(cache.find(&[1, 0]), Some(255), "newest entry = pos 255");
         assert_eq!(cache.get(0), Some([0u8, 1].as_ref()));
         assert_eq!(cache.get(255), Some([1u8, 0].as_ref()));
+    }
+
+    // --- DelayedGameSync (warmup + fixed delay) ---
+
+    fn gd(bytes: Vec<u8>) -> ClientInput {
+        ClientInput::GameData(bytes)
+    }
+
+    #[test]
+    fn test_delay_passthrough_d0() {
+        // D=0 must be a transparent passthrough: input is combined immediately,
+        // no warmup zeros (so the layer can be inserted before RTT-based D is wired).
+        let mut d = DelayedGameSync::new(CachedGameSync::new(vec![1]), 0);
+        let (out, _, _) = d.process_client_input(0, gd(vec![1, 2])).unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].response, ServerResponse::GameData(vec![1, 2]));
+    }
+
+    #[test]
+    fn test_warmup_then_delay_single_player() {
+        // 1 player, D=2: first two inputs return zero frames (warmup), then output
+        // is the real input delayed by exactly 2 frames.
+        let mut d = DelayedGameSync::new(CachedGameSync::new(vec![1]), 2);
+
+        let (o1, _, _) = d.process_client_input(0, gd(vec![1, 2])).unwrap();
+        assert_eq!(
+            o1[0].response,
+            ServerResponse::GameData(vec![0, 0]),
+            "warmup #1 = zero"
+        );
+        let (o2, _, _) = d.process_client_input(0, gd(vec![3, 4])).unwrap();
+        assert_eq!(
+            o2[0].response,
+            ServerResponse::GameData(vec![0, 0]),
+            "warmup #2 = zero"
+        );
+
+        let (o3, _, _) = d.process_client_input(0, gd(vec![5, 6])).unwrap();
+        assert_eq!(
+            o3[0].response,
+            ServerResponse::GameData(vec![1, 2]),
+            "delayed by 2"
+        );
+        let (o4, _, _) = d.process_client_input(0, gd(vec![7, 8])).unwrap();
+        assert_eq!(
+            o4[0].response,
+            ServerResponse::GameData(vec![3, 4]),
+            "delayed by 2"
+        );
+    }
+
+    #[test]
+    fn test_warmup_two_players_then_combine() {
+        // 2 players, D=1. Warmup emits a zero combined-frame (size = players *
+        // frame_size = 4) to each, then the combiner runs on the delayed pair.
+        let mut d = DelayedGameSync::new(CachedGameSync::new(vec![1, 1]), 1);
+
+        let (a, _, _) = d.process_client_input(0, gd(vec![1, 2])).unwrap();
+        assert_eq!(a[0].response, ServerResponse::GameData(vec![0, 0, 0, 0]));
+        let (b, _, _) = d.process_client_input(1, gd(vec![3, 4])).unwrap();
+        assert_eq!(b[0].response, ServerResponse::GameData(vec![0, 0, 0, 0]));
+
+        // p0 releases its delayed [1,2]; p1 hasn't released yet -> nothing combined.
+        let (c, _, _) = d.process_client_input(0, gd(vec![5, 6])).unwrap();
+        assert!(c.is_empty(), "combine waits for all players");
+
+        // p1 releases [3,4] -> combine of the delayed pair [1,2]+[3,4] to both.
+        let (e, _, _) = d.process_client_input(1, gd(vec![7, 8])).unwrap();
+        assert_eq!(e.len(), 2);
+        assert_eq!(e[0].response, ServerResponse::GameData(vec![1, 2, 3, 4]));
+        assert_eq!(e[1].response, ServerResponse::GameData(vec![1, 2, 3, 4]));
     }
 }
