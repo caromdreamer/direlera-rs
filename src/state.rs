@@ -367,7 +367,7 @@ pub struct GameInfo {
     // Player information in order (indexed by player_id)
     pub players: Vec<GamePlayerInfo>,
     // New: SimpleGameSync for frame synchronization
-    pub sync_manager: Option<simplest_game_sync::CachedGameSync>,
+    pub sync_manager: Option<simplest_game_sync::DelayedGameSync>,
     /// Precomputed metric labels (uid/title/emulator), shared cheaply on clone.
     pub metric_labels: std::sync::Arc<GameMetricLabels>,
 }

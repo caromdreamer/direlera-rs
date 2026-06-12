@@ -514,10 +514,11 @@ pub async fn handle_start_game(
     // Initialize SimpleGameSync when game starts
     util::with_game_mut(&state, src, |game_info| {
         game_info.game_status = GAME_STATUS_PLAYING;
-        game_info.sync_manager = Some(
-            simplest_game_sync::CachedGameSync::new(delays.clone())
-                .with_output_cache_disabled(disable_output_cache),
-        );
+        // total_delay = 0 for now (transparent passthrough — no behavior change).
+        // The RTT-based delay buffer + warmup gets wired in a follow-up.
+        let combiner = simplest_game_sync::CachedGameSync::new(delays.clone())
+            .with_output_cache_disabled(disable_output_cache);
+        game_info.sync_manager = Some(simplest_game_sync::DelayedGameSync::new(combiner, 0));
     })
     .await?;
 
@@ -651,7 +652,6 @@ pub async fn execute_drop_game(
             .sync_manager
             .as_ref()
             .ok_or_else(|| eyre!("Sync manager not found"))?
-            .sync
             .all_players_dropped();
 
         // Clone the player list BEFORE any compaction: `outputs` are indexed by the

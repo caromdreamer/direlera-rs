@@ -692,6 +692,10 @@ impl DelayedGameSync {
     pub fn get_player_delay(&self, player_id: usize) -> usize {
         self.inner.get_player_delay(player_id)
     }
+
+    pub fn all_players_dropped(&self) -> bool {
+        self.inner.sync.all_players_dropped()
+    }
 }
 
 #[cfg(test)]
