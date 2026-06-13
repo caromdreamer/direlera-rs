@@ -257,35 +257,34 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
             // players that have gone silent long enough to be considered gone (reap).
             type StalledPlayer = (SocketAddr, Arc<crate::state::GameMetricLabels>, Duration);
             let (stalled, dead): (Vec<StalledPlayer>, Vec<SocketAddr>) = {
-                let game_ids: Vec<u32> =
-                    { global_state.games.read().await.keys().copied().collect() };
+                let game_arcs: Vec<_> =
+                    { global_state.games.read().await.values().cloned().collect() };
                 let mut out = Vec::new();
                 let mut dead = Vec::new();
-                for gid in game_ids {
-                    if let Some(game) = global_state.get_game(gid).await {
-                        if game.game_status != crate::state::GAME_STATUS_PLAYING {
+                for game_arc in game_arcs {
+                    let game = game_arc.lock().await;
+                    if game.game_status != crate::state::GAME_STATUS_PLAYING {
+                        continue;
+                    }
+                    for (player_id, p) in game.players.iter().enumerate() {
+                        // The game stays PLAYING until the last player leaves, so a
+                        // player who already dropped is still listed here with a stale
+                        // last_game_data_recv. They aren't waiting on input — resending
+                        // to them is wasted work and floods the log until they fully quit.
+                        if game
+                            .sync_manager
+                            .as_ref()
+                            .is_some_and(|m| m.is_player_dropped(player_id))
+                        {
                             continue;
                         }
-                        for (player_id, p) in game.players.iter().enumerate() {
-                            // The game stays PLAYING until the last player leaves, so a
-                            // player who already dropped is still listed here with a stale
-                            // last_game_data_recv. They aren't waiting on input — resending
-                            // to them is wasted work and floods the log until they fully quit.
-                            if game
-                                .sync_manager
-                                .as_ref()
-                                .is_some_and(|m| m.is_player_dropped(player_id))
-                            {
-                                continue;
-                            }
-                            if let Some(last) = p.last_game_data_recv {
-                                let stalled_for = now.duration_since(last);
-                                if stalled_for >= PLAYING_INPUT_TIMEOUT {
-                                    // Gone, not merely stalled: reap instead of resending.
-                                    dead.push(p.addr);
-                                } else if stalled_for >= STALL_THRESHOLD {
-                                    out.push((p.addr, game.metric_labels.clone(), stalled_for));
-                                }
+                        if let Some(last) = p.last_game_data_recv {
+                            let stalled_for = now.duration_since(last);
+                            if stalled_for >= PLAYING_INPUT_TIMEOUT {
+                                // Gone, not merely stalled: reap instead of resending.
+                                dead.push(p.addr);
+                            } else if stalled_for >= STALL_THRESHOLD {
+                                out.push((p.addr, game.metric_labels.clone(), stalled_for));
                             }
                         }
                     }

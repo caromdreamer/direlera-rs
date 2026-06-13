@@ -22,38 +22,19 @@ type TargetOutput = (std::net::SocketAddr, simplest_game_sync::ServerResponse);
 fn record_input_pacing(
     player: &mut GamePlayerInfo,
     now: std::time::Instant,
-    labels: &GameMetricLabels,
-    player_count: usize,
+    handles: Option<&GameMetricHandles>,
 ) {
     if let Some(last_recv) = player.last_game_data_recv {
         let interval = now.duration_since(last_recv).as_secs_f64();
-        // Per-game labels so a single bad game can be isolated on a dashboard
-        // (one stalling game would otherwise drag the whole aggregate down).
-        // game_uid is a restart-safe UUID; series are bounded by the exporter's
-        // idle_timeout (main.rs). Label values are precomputed (no hot-path alloc).
-        let uid = labels.game_uid.clone();
-        let title = labels.game_name.clone();
-        let emulator = labels.emulator_name.clone();
-        let pc = player_count.to_string();
-        // Absolute interval — for an at-a-glance pace view.
-        metrics::histogram!(
-            "client_input_interval_seconds",
-            "game_uid" => uid.clone(),
-            "game_name" => title.clone(),
-            "emulator_name" => emulator.clone(),
-            "player_count" => pc.clone(),
-        )
-        .record(interval);
+        if let Some(handles) = handles {
+            // Absolute interval — for an at-a-glance pace view.
+            handles.input_interval.record(interval);
+        }
         match player.interval_baseline_secs {
             Some(baseline) if baseline > 0.0 => {
-                metrics::histogram!(
-                    "client_input_pace_ratio",
-                    "game_uid" => uid,
-                    "game_name" => title,
-                    "emulator_name" => emulator,
-                    "player_count" => pc,
-                )
-                .record(interval / baseline);
+                if let Some(handles) = handles {
+                    handles.input_pace_ratio.record(interval / baseline);
+                }
                 player.interval_baseline_secs = Some(
                     INTERVAL_BASELINE_ALPHA * interval + (1.0 - INTERVAL_BASELINE_ALPHA) * baseline,
                 );
@@ -93,17 +74,16 @@ pub async fn handle_game_data(
     // Process with SimpleGameSync (per-game lock — does not block other games).
     // Resolve output target addresses while holding the same game lock so the
     // hot path does not clone the whole GameInfo/sync_manager just to send.
-    let (target_outputs, player_count) = state
+    let (target_outputs, metric_handles) = state
         .update_game(
             game_id,
-            |game_info| -> color_eyre::Result<(Vec<TargetOutput>, usize)> {
+            |game_info| -> color_eyre::Result<(Vec<TargetOutput>, Option<Arc<GameMetricHandles>>)> {
                 // Input pacing: how fast this player's inputs arrive vs the game's
                 // own steady-state pace (fps/conn_type-agnostic stall signal).
                 let now = Instant::now();
-                let player_count = game_info.players.len();
-                let labels = game_info.metric_labels.clone();
+                let metric_handles = game_info.metric_handles.clone();
                 if let Some(player) = game_info.players.get_mut(player_id) {
-                    record_input_pacing(player, now, &labels, player_count);
+                    record_input_pacing(player, now, metric_handles.as_deref());
                 }
 
                 let sync_manager = game_info
@@ -135,7 +115,7 @@ pub async fn handle_game_data(
                     })
                     .collect::<color_eyre::Result<Vec<_>>>()?;
 
-                Ok((target_outputs, player_count))
+                Ok((target_outputs, metric_handles))
             },
         )
         .await?;
@@ -155,12 +135,9 @@ pub async fn handle_game_data(
         util::send_packet(&state, &target_addr, message_type, data_to_send).await?;
     }
 
-    metrics::histogram!(
-        "game_sync_processing_seconds",
-        "type" => "game_data",
-        "player_count" => player_count.to_string(),
-    )
-    .record(start.elapsed().as_secs_f64());
+    if let Some(handles) = metric_handles {
+        handles.game_data_processing.record(start.elapsed());
+    }
 
     Ok(())
 }
@@ -189,15 +166,17 @@ pub async fn handle_game_cache(
     let sync_result: Result<_, simplest_game_sync::GameSyncError> = state
         .update_game(
             game_id,
-            |game_info| -> Result<(Vec<TargetOutput>, usize), simplest_game_sync::GameSyncError> {
+            |game_info| -> Result<
+                (Vec<TargetOutput>, Option<Arc<GameMetricHandles>>),
+                simplest_game_sync::GameSyncError,
+            > {
                 // Cache packets are the bulk of steady-state traffic, so they must
                 // feed the same pacing metric as game_data (else most of the game
                 // is invisible to the responsiveness signal).
                 let now = Instant::now();
-                let player_count = game_info.players.len();
-                let labels = game_info.metric_labels.clone();
+                let metric_handles = game_info.metric_handles.clone();
                 if let Some(player) = game_info.players.get_mut(player_id) {
-                    record_input_pacing(player, now, &labels, player_count);
+                    record_input_pacing(player, now, metric_handles.as_deref());
                 }
                 let sync_manager = game_info.sync_manager.as_mut().ok_or(
                     simplest_game_sync::GameSyncError::BufferInconsistency {
@@ -226,12 +205,12 @@ pub async fn handle_game_cache(
                     })
                     .collect::<Result<Vec<_>, simplest_game_sync::GameSyncError>>()?;
 
-                Ok((target_outputs, player_count))
+                Ok((target_outputs, metric_handles))
             },
         )
         .await;
 
-    let (target_outputs, player_count) = match sync_result {
+    let (target_outputs, metric_handles) = match sync_result {
         Ok(outputs) => outputs,
         Err(simplest_game_sync::GameSyncError::CachePositionNotFound {
             player_id,
@@ -266,12 +245,9 @@ pub async fn handle_game_cache(
         util::send_packet(&state, &target_addr, message_type, data_to_send).await?;
     }
 
-    metrics::histogram!(
-        "game_sync_processing_seconds",
-        "type" => "game_data",
-        "player_count" => player_count.to_string(),
-    )
-    .record(start.elapsed().as_secs_f64());
+    if let Some(handles) = metric_handles {
+        handles.game_cache_processing.record(start.elapsed());
+    }
 
     Ok(())
 }

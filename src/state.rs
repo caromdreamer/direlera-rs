@@ -356,6 +356,16 @@ pub struct GameMetricLabels {
     pub emulator_name: String,
 }
 
+/// Pre-registered metric handles for a playing game. Holding handles avoids
+/// rebuilding label vectors and looking up metric keys on every input packet.
+#[derive(Debug, Clone)]
+pub struct GameMetricHandles {
+    pub input_interval: metrics::Histogram,
+    pub input_pace_ratio: metrics::Histogram,
+    pub game_data_processing: metrics::Histogram,
+    pub game_cache_processing: metrics::Histogram,
+}
+
 #[derive(Debug, Clone)]
 pub struct GameInfo {
     pub game_id: u32,
@@ -372,6 +382,8 @@ pub struct GameInfo {
     pub sync_manager: Option<simplest_game_sync::DelayedGameSync>,
     /// Precomputed metric labels (uid/title/emulator), shared cheaply on clone.
     pub metric_labels: std::sync::Arc<GameMetricLabels>,
+    /// Metric handles installed when the game starts and player count is fixed.
+    pub metric_handles: Option<std::sync::Arc<GameMetricHandles>>,
 }
 
 impl GameInfo {

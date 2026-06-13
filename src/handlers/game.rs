@@ -88,6 +88,7 @@ pub async fn handle_create_game(
             game_name: util::sanitize_label(&game_name),
             emulator_name: util::sanitize_label(&emulator_name),
         }),
+        metric_handles: None,
     };
 
     // Add game
@@ -567,6 +568,34 @@ pub async fn handle_start_game(
             combiner,
             sync_delays.clone(),
         ));
+        let labels = game_info.metric_labels.as_ref();
+        let player_count = game_info.players.len().to_string();
+        game_info.metric_handles = Some(Arc::new(GameMetricHandles {
+            input_interval: metrics::histogram!(
+                "client_input_interval_seconds",
+                "game_uid" => labels.game_uid.clone(),
+                "game_name" => labels.game_name.clone(),
+                "emulator_name" => labels.emulator_name.clone(),
+                "player_count" => player_count.clone(),
+            ),
+            input_pace_ratio: metrics::histogram!(
+                "client_input_pace_ratio",
+                "game_uid" => labels.game_uid.clone(),
+                "game_name" => labels.game_name.clone(),
+                "emulator_name" => labels.emulator_name.clone(),
+                "player_count" => player_count.clone(),
+            ),
+            game_data_processing: metrics::histogram!(
+                "game_sync_processing_seconds",
+                "type" => "game_data",
+                "player_count" => player_count.clone(),
+            ),
+            game_cache_processing: metrics::histogram!(
+                "game_sync_processing_seconds",
+                "type" => "game_cache",
+                "player_count" => player_count,
+            ),
+        }));
     })
     .await?;
 
