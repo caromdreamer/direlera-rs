@@ -163,6 +163,9 @@ pub async fn broadcast_packet(
             .filter_map(|addr| {
                 let session_id = addr_map.get(addr)?;
                 let client = id_map.get_mut(session_id)?;
+                if client.ack_count <= crate::handlers::NUM_ACKS_FOR_SPEED_TEST {
+                    return None;
+                }
                 let packet = client
                     .packet_generator
                     .make_send_packet(packet_type, data.clone());
@@ -591,23 +594,30 @@ pub async fn make_server_status(
     let mut data = BytesMut::new();
     packet_util::put_empty_string(&mut data);
 
-    // Number of users (excluding self)
-    let num_users = addr_map.len().saturating_sub(1);
-    data.put_u32_le(num_users as u32);
+    let visible_users = addr_map
+        .iter()
+        .filter_map(|(addr, session_id)| {
+            if addr == src {
+                return None;
+            }
+            let client_info = id_map.get(session_id)?;
+            (client_info.ack_count > crate::handlers::NUM_ACKS_FOR_SPEED_TEST)
+                .then_some(client_info)
+        })
+        .collect::<Vec<_>>();
+
+    // Number of fully logged-in users (excluding self).
+    data.put_u32_le(visible_users.len() as u32);
 
     data.put_u32_le(num_games);
 
     // User list
-    for (addr, session_id) in addr_map.iter() {
-        if addr != src {
-            if let Some(client_info) = id_map.get(session_id) {
-                packet_util::put_bytes_with_null(&mut data, &client_info.username);
-                data.put_u32_le(client_info.ping);
-                data.put_u8(client_info.player_status);
-                data.put_u16_le(client_info.user_id);
-                data.put_u8(client_info.conn_type);
-            }
-        }
+    for client_info in visible_users {
+        packet_util::put_bytes_with_null(&mut data, &client_info.username);
+        data.put_u32_le(client_info.ping);
+        data.put_u8(client_info.player_status);
+        data.put_u16_le(client_info.user_id);
+        data.put_u8(client_info.conn_type);
     }
 
     // Game list — lock each game independently

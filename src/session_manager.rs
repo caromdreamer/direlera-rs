@@ -21,6 +21,7 @@ const SESSION_TIMEOUT: Duration = Duration::from_secs(120);
 /// of squatting a full SESSION_TIMEOUT and emitting a spurious lobby notice.
 const PRE_LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
+const LOGIN_ACK_RESEND_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Stall recovery: if a playing client hasn't sent game input for this long, it
 /// likely missed a server->client packet (lockstep freeze). Resend its last
@@ -99,11 +100,14 @@ impl SessionManager {
             tokio::select! {
                 maybe_packet = packet_rx.recv() => {
                     let Some((addr, data)) = maybe_packet else { break };
-                    let sessions = self.sessions.read().await;
+                    let tx = {
+                        let sessions = self.sessions.read().await;
+                        sessions.get(&addr).map(|session| session.tx.clone())
+                    };
 
-                    if let Some(session) = sessions.get(&addr) {
+                    if let Some(tx) = tx {
                         // Existing session - forward packet
-                        if let Err(e) = session.tx.send(data).await {
+                        if let Err(e) = tx.send(data).await {
                             warn!(
                                 { fields::ADDR } = %addr,
                                 { fields::ERROR } = %e,
@@ -112,7 +116,6 @@ impl SessionManager {
                         }
                     } else {
                         // New session - spawn handler
-                        drop(sessions);
                         self.spawn_session_handler(addr, data, global_state.clone())
                             .await;
                     }
@@ -340,6 +343,44 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                     "Playing client sent no game input past timeout; requesting session teardown"
                 );
                 let _ = global_state.session_close_tx.send(addr).await;
+            }
+        }
+    });
+}
+
+/// Keep the login ACK handshake reliable over UDP. A client that misses the
+/// first SERVER_TO_CLIENT_ACK has no game/lobby state yet, so the gameplay stall
+/// resend task cannot help it. While the ACK speed-test is incomplete, resend the
+/// last outbound packet verbatim; clients dedupe by message number.
+pub fn start_login_resend_task(global_state: Arc<AppState>) {
+    tokio::spawn(async move {
+        debug!("Login ACK resend task started");
+        loop {
+            tokio::time::sleep(LOGIN_ACK_RESEND_INTERVAL).await;
+
+            let pending: Vec<(SocketAddr, Vec<u8>)> = {
+                let addr_map = global_state.clients_by_addr.read().await;
+                let id_map = global_state.clients_by_id.read().await;
+                addr_map
+                    .iter()
+                    .filter_map(|(addr, sid)| {
+                        let client = id_map.get(sid)?;
+                        if client.game_id.is_none()
+                            && client.ack_count <= crate::handlers::NUM_ACKS_FOR_SPEED_TEST
+                        {
+                            client
+                                .packet_generator
+                                .last_sent()
+                                .map(|packet| (*addr, packet))
+                        } else {
+                            None
+                        }
+                    })
+                    .collect()
+            };
+
+            for (addr, data) in pending {
+                let _ = global_state.tx.send(crate::Message { data, addr }).await;
             }
         }
     });

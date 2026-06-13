@@ -14,7 +14,7 @@ use crate::*;
 // replying with SERVER_TO_CLIENT_ACK until this many round trips have completed,
 // then averages them (the handshake is finalized on the round trip *after* this
 // count, i.e. the 4th).
-const NUM_ACKS_FOR_SPEED_TEST: u16 = 3;
+pub(crate) const NUM_ACKS_FOR_SPEED_TEST: u16 = 3;
 
 // Handlers run as named child spans of the long-lived session span; the session
 // span already carries addr/identity/ping/game_id, so we skip_all here to avoid
@@ -89,9 +89,6 @@ pub async fn handle_client_to_server_ack(
         .await?;
 
     if ack_count > NUM_ACKS_FOR_SPEED_TEST {
-        let data = util::make_server_status(src, &state).await?;
-        util::send_packet(&state, src, msg::SERVER_STATUS, data).await?;
-
         let data = util::make_user_joined(src, &state).await?;
         util::broadcast_packet(&state, msg::USER_JOINED, data).await?;
 
@@ -102,6 +99,12 @@ pub async fn handle_client_to_server_ack(
         for data in info_lines {
             util::send_packet(&state, src, msg::SERVER_INFORMATION, data).await?;
         }
+
+        // SERVER_STATUS is the login completion signal for clients. Send it last
+        // so the latest reliability bundle always contains it, even if welcome
+        // or USER_JOINED packets are also emitted during a login burst.
+        let data = util::make_server_status(src, &state).await?;
+        util::send_packet(&state, src, msg::SERVER_STATUS, data).await?;
     } else {
         // Server notification creation
         let data = packet_util::build_server_to_client_ack_packet();

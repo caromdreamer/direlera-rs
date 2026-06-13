@@ -86,10 +86,12 @@ impl AppState {
     pub async fn add_client(&self, addr: SocketAddr, client: ClientInfo) {
         let session_id = client.session_id;
 
+        // Keep the same lock order as update/remove paths (addr -> id). Login
+        // bursts otherwise can deadlock against ACK handling, which looks like
+        // clients timing out before receiving any server ACK.
+        let mut addr_map = self.clients_by_addr.write().await;
         let mut id_map = self.clients_by_id.write().await;
         id_map.insert(session_id, client);
-
-        let mut addr_map = self.clients_by_addr.write().await;
         addr_map.insert(addr, session_id);
 
         metrics::gauge!("active_sessions_total").increment(1.0);

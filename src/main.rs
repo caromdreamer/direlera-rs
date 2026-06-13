@@ -596,6 +596,7 @@ async fn main() -> color_eyre::Result<()> {
 
     // Start stall recovery task — resends the last packet to stalled players
     session_manager::start_stall_resend_task(global_state.clone());
+    session_manager::start_login_resend_task(global_state.clone());
 
     // Start session manager (spawns handlers for each client)
     let manager_for_run = session_manager.clone();
@@ -692,7 +693,7 @@ async fn process_packet_in_session(
         Ok(messages) => {
             for message in messages.iter() {
                 // Message number 0 signals the start of a new sequence
-                if message.message_number == 0 && messages.len() == 1 {
+                if message.message_number == 0 && messages.len() == 1 && *packet_counter == 0 {
                     *packet_counter = 0;
                     pending_messages.clear();
                 }
