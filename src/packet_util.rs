@@ -78,6 +78,14 @@ pub fn parse_packet(data: &[u8]) -> Result<Vec<kaillera::protocol::ParsedMessage
         let message_number = buf.get_u16_le();
         let message_length = buf.get_u16_le();
         let message_type = buf.get_u8();
+        if message_length < 1 {
+            return Err(format!(
+                "Invalid message length {} at message {}/{}",
+                message_length,
+                i + 1,
+                num_messages
+            ));
+        }
 
         if buf.len() < (message_length - 1) as usize {
             return Err("Incomplete message data.".to_string());

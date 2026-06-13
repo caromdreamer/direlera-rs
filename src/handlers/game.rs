@@ -144,8 +144,22 @@ pub async fn handle_join_game(
     // Parse message
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = util::read_string_bytes(&mut buf);
+    if buf.len() < 11 {
+        warn!(
+            payload_len = message.data.len(),
+            "Join game ignored: malformed payload"
+        );
+        return Ok(());
+    }
     let game_id = buf.get_u32_le();
     let _ = util::read_string_bytes(&mut buf);
+    if buf.len() < 7 {
+        warn!(
+            payload_len = message.data.len(),
+            "Join game ignored: truncated payload"
+        );
+        return Ok(());
+    }
     let _ = buf.get_u32_le();
     let _ = buf.get_u16_le();
     let _conn_type = buf.get_u8();
@@ -164,6 +178,28 @@ pub async fn handle_join_game(
             game_id
         );
         return Ok(()); // Silently ignore invalid request
+    }
+
+    let Some(game_info) = state.get_game(game_id).await else {
+        warn!("Join ignored: game {} not found", game_id);
+        return Ok(());
+    };
+    if game_info.game_status != GAME_STATUS_WAITING || game_info.sync_manager.is_some() {
+        warn!(
+            game_id,
+            status = game_info.game_status,
+            "Join ignored: game already started"
+        );
+        return Ok(());
+    }
+    if game_info.num_players >= game_info.max_players {
+        warn!(
+            game_id,
+            players = game_info.num_players,
+            max_players = game_info.max_players,
+            "Join ignored: game is full"
+        );
+        return Ok(());
     }
 
     util::with_client_mut(&state, src, |client_info| {
@@ -454,6 +490,13 @@ pub async fn handle_start_game(
     let mut buf = BytesMut::from(&message.data[..]);
     let start = Instant::now();
     let _ = util::read_string_bytes(&mut buf); // Empty String
+    if buf.len() < 4 {
+        warn!(
+            payload_len = message.data.len(),
+            "Start game ignored: malformed payload"
+        );
+        return Ok(());
+    }
     let _ = buf.get_u32_le(); // 0xFFFF 0xFF 0xFF
 
     let client = state
@@ -874,6 +917,13 @@ pub async fn handle_kick_user(
     let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
     let _ = util::read_string_bytes(&mut buf); // Empty String
+    if buf.len() < 2 {
+        warn!(
+            payload_len = message.data.len(),
+            "Kick user ignored: malformed payload"
+        );
+        return Ok(());
+    }
     let user_id = buf.get_u16_le(); // UserID
 
     // Check if requester is the game owner (using user_id to prevent nickname abuse)

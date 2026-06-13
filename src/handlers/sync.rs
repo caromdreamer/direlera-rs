@@ -2,7 +2,7 @@ use bytes::{Buf, BytesMut};
 use color_eyre::eyre::eyre;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use super::util;
 use crate::kaillera::message_types as msg;
@@ -61,8 +61,24 @@ pub async fn handle_game_data(
 ) -> color_eyre::Result<()> {
     let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
+    if buf.len() < 3 {
+        warn!(
+            payload_len = message.data.len(),
+            "Game data ignored: malformed payload"
+        );
+        return Ok(());
+    }
     let _ = buf.get_u8(); // Empty String
     let data_length = buf.get_u16_le() as usize;
+    if buf.len() < data_length {
+        warn!(
+            payload_len = message.data.len(),
+            data_length,
+            remaining = buf.len(),
+            "Game data ignored: truncated payload"
+        );
+        return Ok(());
+    }
     let game_data = buf.split_to(data_length).to_vec();
 
     let Some((game_id, player_id)) = util::resolve_in_game(&state, src).await else {
@@ -152,6 +168,13 @@ pub async fn handle_game_cache(
 ) -> color_eyre::Result<()> {
     let start = Instant::now();
     let mut buf = BytesMut::from(&message.data[..]);
+    if buf.len() < 2 {
+        warn!(
+            payload_len = message.data.len(),
+            "Game cache ignored: malformed payload"
+        );
+        return Ok(());
+    }
     let _ = buf.get_u8(); // Empty String
     let cache_position = buf.get_u8();
 
@@ -262,6 +285,10 @@ pub async fn handle_ready_to_play_signal(
     use tracing::info;
     debug!("Ready to play signal received");
     let mut buf = BytesMut::from(&message.data[..]);
+    if buf.is_empty() {
+        warn!("Ready to play ignored: malformed payload");
+        return Ok(());
+    }
     let _ = buf.get_u8(); // Empty String
 
     let already_playing = state
