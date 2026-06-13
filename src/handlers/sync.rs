@@ -13,6 +13,7 @@ use crate::*;
 /// transient spikes barely move the baseline, so a real slowdown surfaces as a
 /// ratio > 1 instead of being absorbed into "normal".
 const INTERVAL_BASELINE_ALPHA: f64 = 0.1;
+type TargetOutput = (std::net::SocketAddr, simplest_game_sync::ServerResponse);
 
 /// Record input-pacing metrics for a player on every input packet (game_data or
 /// game_cache). The pace ratio (current interval / the game's own EWMA baseline)
@@ -89,51 +90,59 @@ pub async fn handle_game_data(
     };
     tracing::Span::current().record("player_id", player_id);
 
-    // Process with SimpleGameSync (per-game lock — does not block other games)
-    let (outputs, _cache_overflowed, _cache_milestone) = state
-        .update_game(game_id, |game_info| {
-            // Input pacing: how fast this player's inputs arrive vs the game's
-            // own steady-state pace (fps/conn_type-agnostic stall signal).
-            let now = Instant::now();
-            let player_count = game_info.players.len();
-            let labels = game_info.metric_labels.clone();
-            if let Some(player) = game_info.players.get_mut(player_id) {
-                record_input_pacing(player, now, &labels, player_count);
-            }
+    // Process with SimpleGameSync (per-game lock — does not block other games).
+    // Resolve output target addresses while holding the same game lock so the
+    // hot path does not clone the whole GameInfo/sync_manager just to send.
+    let (target_outputs, player_count) = state
+        .update_game(
+            game_id,
+            |game_info| -> color_eyre::Result<(Vec<TargetOutput>, usize)> {
+                // Input pacing: how fast this player's inputs arrive vs the game's
+                // own steady-state pace (fps/conn_type-agnostic stall signal).
+                let now = Instant::now();
+                let player_count = game_info.players.len();
+                let labels = game_info.metric_labels.clone();
+                if let Some(player) = game_info.players.get_mut(player_id) {
+                    record_input_pacing(player, now, &labels, player_count);
+                }
 
-            let sync_manager = game_info
-                .sync_manager
-                .as_mut()
-                .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
-            sync_manager
-                .process_client_input(
-                    player_id,
-                    simplest_game_sync::ClientInput::GameData(game_data),
-                )
-                .map_err(|e| eyre!("Game sync error: {}", e))
-        })
+                let sync_manager = game_info
+                    .sync_manager
+                    .as_mut()
+                    .ok_or_else(|| eyre!("SimpleGameSync not initialized"))?;
+                let (outputs, _cache_overflowed, _cache_milestone) = sync_manager
+                    .process_client_input(
+                        player_id,
+                        simplest_game_sync::ClientInput::GameData(game_data),
+                    )
+                    .map_err(|e| eyre!("Game sync error: {}", e))?;
+
+                let target_outputs = outputs
+                    .into_iter()
+                    .map(|output| {
+                        let target_addr = game_info
+                            .players
+                            .get(output.player_id)
+                            .ok_or_else(|| {
+                                eyre!(
+                                    "Invalid player_id: {} (players count: {})",
+                                    output.player_id,
+                                    game_info.players.len()
+                                )
+                            })?
+                            .addr;
+                        Ok((target_addr, output.response))
+                    })
+                    .collect::<color_eyre::Result<Vec<_>>>()?;
+
+                Ok((target_outputs, player_count))
+            },
+        )
         .await?;
 
     // Send outputs to respective players
-    let game_info = state
-        .get_game(game_id)
-        .await
-        .ok_or_else(|| eyre!("Game not found"))?;
-    for output in outputs {
-        // Safety check: ensure player_id is within bounds
-        let target_addr = game_info
-            .players
-            .get(output.player_id)
-            .ok_or_else(|| {
-                eyre!(
-                    "Invalid player_id: {} (players count: {})",
-                    output.player_id,
-                    game_info.players.len()
-                )
-            })?
-            .addr;
-
-        let (message_type, data_to_send) = match output.response {
+    for (target_addr, response) in target_outputs {
+        let (message_type, data_to_send) = match response {
             simplest_game_sync::ServerResponse::GameData(data) => {
                 (msg::GAME_DATA, packet_util::build_game_data_packet(&data))
             }
@@ -149,7 +158,7 @@ pub async fn handle_game_data(
     metrics::histogram!(
         "game_sync_processing_seconds",
         "type" => "game_data",
-        "player_count" => game_info.players.len().to_string(),
+        "player_count" => player_count.to_string(),
     )
     .record(start.elapsed().as_secs_f64());
 
@@ -178,29 +187,51 @@ pub async fn handle_game_cache(
     // Process with SimpleGameSync. Return GameSyncError directly so we can inspect
     // the variant before converting to eyre (cache-miss needs a client notification).
     let sync_result: Result<_, simplest_game_sync::GameSyncError> = state
-        .update_game(game_id, |game_info| {
-            // Cache packets are the bulk of steady-state traffic, so they must
-            // feed the same pacing metric as game_data (else most of the game
-            // is invisible to the responsiveness signal).
-            let now = Instant::now();
-            let player_count = game_info.players.len();
-            let labels = game_info.metric_labels.clone();
-            if let Some(player) = game_info.players.get_mut(player_id) {
-                record_input_pacing(player, now, &labels, player_count);
-            }
-            let sync_manager = game_info.sync_manager.as_mut().ok_or(
-                simplest_game_sync::GameSyncError::BufferInconsistency {
-                    message: "sync_manager not initialized".into(),
-                },
-            )?;
-            sync_manager.process_client_input(
-                player_id,
-                simplest_game_sync::ClientInput::GameCache(cache_position),
-            )
-        })
+        .update_game(
+            game_id,
+            |game_info| -> Result<(Vec<TargetOutput>, usize), simplest_game_sync::GameSyncError> {
+                // Cache packets are the bulk of steady-state traffic, so they must
+                // feed the same pacing metric as game_data (else most of the game
+                // is invisible to the responsiveness signal).
+                let now = Instant::now();
+                let player_count = game_info.players.len();
+                let labels = game_info.metric_labels.clone();
+                if let Some(player) = game_info.players.get_mut(player_id) {
+                    record_input_pacing(player, now, &labels, player_count);
+                }
+                let sync_manager = game_info.sync_manager.as_mut().ok_or(
+                    simplest_game_sync::GameSyncError::BufferInconsistency {
+                        message: "sync_manager not initialized".into(),
+                    },
+                )?;
+                let (outputs, _cache_overflowed, _cache_milestone) = sync_manager
+                    .process_client_input(
+                        player_id,
+                        simplest_game_sync::ClientInput::GameCache(cache_position),
+                    )?;
+
+                let target_outputs = outputs
+                    .into_iter()
+                    .map(|output| {
+                        let target_addr =
+                            game_info
+                                .players
+                                .get(output.player_id)
+                                .map(|p| p.addr)
+                                .ok_or(simplest_game_sync::GameSyncError::InvalidPlayerId {
+                                    player_id: output.player_id,
+                                    player_count: game_info.players.len(),
+                                })?;
+                        Ok((target_addr, output.response))
+                    })
+                    .collect::<Result<Vec<_>, simplest_game_sync::GameSyncError>>()?;
+
+                Ok((target_outputs, player_count))
+            },
+        )
         .await;
 
-    let (outputs, _cache_overflowed, _cache_milestone) = match sync_result {
+    let (target_outputs, player_count) = match sync_result {
         Ok(outputs) => outputs,
         Err(simplest_game_sync::GameSyncError::CachePositionNotFound {
             player_id,
@@ -221,25 +252,8 @@ pub async fn handle_game_cache(
     };
 
     // Send outputs to respective players
-    let game_info = state
-        .get_game(game_id)
-        .await
-        .ok_or_else(|| eyre!("Game not found"))?;
-    for output in outputs {
-        // Safety check: ensure player_id is within bounds
-        let target_addr = game_info
-            .players
-            .get(output.player_id)
-            .ok_or_else(|| {
-                eyre!(
-                    "Invalid player_id: {} (players count: {})",
-                    output.player_id,
-                    game_info.players.len()
-                )
-            })?
-            .addr;
-
-        let (message_type, data_to_send) = match output.response {
+    for (target_addr, response) in target_outputs {
+        let (message_type, data_to_send) = match response {
             simplest_game_sync::ServerResponse::GameData(data) => {
                 (msg::GAME_DATA, packet_util::build_game_data_packet(&data))
             }
@@ -255,7 +269,7 @@ pub async fn handle_game_cache(
     metrics::histogram!(
         "game_sync_processing_seconds",
         "type" => "game_data",
-        "player_count" => game_info.players.len().to_string(),
+        "player_count" => player_count.to_string(),
     )
     .record(start.elapsed().as_secs_f64());
 

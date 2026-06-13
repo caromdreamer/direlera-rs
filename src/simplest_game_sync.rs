@@ -378,7 +378,7 @@ impl SimplestGameSync {
                 player_count: self.dropped_players.len(),
             });
         }
-        println!("Marking player {} as dropped", player_id);
+        tracing::debug!(player_id, "marking player as dropped");
         self.dropped_players[player_id] = true;
         self.drain_ready_inputs()
     }

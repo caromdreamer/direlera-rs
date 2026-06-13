@@ -675,9 +675,18 @@ pub async fn fetch_game_info(
 /// Callers should silently drop the packet (debug log + `Ok(())`) instead of
 /// bubbling an error that the message loop would log at `error!`.
 pub async fn resolve_in_game(state: &AppState, src: &std::net::SocketAddr) -> Option<(u32, usize)> {
-    let client = state.get_client(src).await?;
-    let game_id = client.game_id?;
-    let game_info = state.get_game(game_id).await?;
+    let game_id = {
+        let addr_map = state.clients_by_addr.read().await;
+        let session_id = addr_map.get(src)?;
+        let id_map = state.clients_by_id.read().await;
+        id_map.get(session_id)?.game_id?
+    };
+
+    let game_arc = {
+        let games = state.games.read().await;
+        games.get(&game_id)?.clone()
+    };
+    let game_info = game_arc.lock().await;
     let player_id = game_info.players.iter().position(|p| p.addr == *src)?;
     Some((game_id, player_id))
 }

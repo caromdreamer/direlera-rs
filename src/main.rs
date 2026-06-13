@@ -741,7 +741,7 @@ async fn process_packet_in_session(
                 // Stall detection #1 (pull / inbound): the client itself signaled a
                 // stall by re-sending an already-seen bundle. Logged so we can compare
                 // its timing against the 100ms server-side stall-resend push below.
-                info!(
+                debug!(
                     detector = "zero-new-inbound",
                     expected_message_number = *packet_counter,
                     "stall detected: client resent already-seen bundle"

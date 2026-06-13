@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::timeout;
-use tracing::{info, warn, Instrument};
+use tracing::{debug, info, warn, Instrument};
 
 use crate::{fields, packet_util, AppState};
 
@@ -125,7 +125,7 @@ impl SessionManager {
                     // full SESSION_TIMEOUT and emitting a spurious timeout notice.
                     let removed = { self.sessions.write().await.remove(&addr) };
                     if removed.is_some() {
-                        info!({ fields::ADDR } = %addr, "Session closed on request");
+                        debug!({ fields::ADDR } = %addr, "Session closed on request");
                     }
                 }
             }
@@ -151,7 +151,7 @@ impl SessionManager {
             sessions.insert(addr, session);
         }
 
-        info!({ fields::ADDR } = %addr, "New session spawned");
+        debug!({ fields::ADDR } = %addr, "New session spawned");
 
         // Send initial packet to the session channel
         if let Err(e) = tx.send(initial_data).await {
@@ -366,7 +366,7 @@ async fn handle_session(
         game_id = tracing::field::Empty,
     );
     async move {
-        info!("Session handler started");
+        debug!("Session handler started");
 
         // Per-session packet counter — no global lock needed
         let mut packet_counter: u16 = 0;
@@ -504,7 +504,7 @@ async fn handle_session(
                         // Never logged in (server-browser probe, stray/out-of-sequence
                         // packet, rejected login): not a real user, so reap silently
                         // without spamming the lobby. Just log it for diagnostics.
-                        info!(
+                        debug!(
                             { fields::ADDR } = %addr,
                             "Pre-login session reaped (no login); no lobby notice"
                         );
@@ -523,7 +523,7 @@ async fn handle_session(
         // Clean up from global state (safe even if already removed)
         let _ = global_state.remove_client(&addr).await;
 
-        info!("Session terminated");
+        debug!("Session terminated");
     }
     .instrument(span)
     .await
