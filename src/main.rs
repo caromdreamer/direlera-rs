@@ -2,6 +2,7 @@ use direlera_rs::logger::{init_logger, LogFormat, LogLevel, LokiConfig};
 use packet_util::*;
 use serde::Deserialize;
 use std::collections::BTreeMap;
+use std::env;
 use std::fs;
 use std::sync::Arc;
 use tokio::net::UdpSocket;
@@ -304,13 +305,20 @@ fn default_welcome_message() -> String {
 // Load configuration from config.toml
 fn load_config() -> Config {
     match fs::read_to_string("config.toml") {
-        Ok(contents) => match toml::from_str(&contents) {
-            Ok(config) => {
-                eprintln!("Configuration loaded from config.toml");
-                config
-            }
+        Ok(contents) => match expand_config_vars(&contents) {
+            Ok(expanded) => match toml::from_str(&expanded) {
+                Ok(config) => {
+                    eprintln!("Configuration loaded from config.toml");
+                    config
+                }
+                Err(e) => {
+                    eprintln!("Failed to parse config.toml: {}", e);
+                    eprintln!("Using default configuration");
+                    Config::default()
+                }
+            },
             Err(e) => {
-                eprintln!("Failed to parse config.toml: {}", e);
+                eprintln!("Failed to expand config.toml variables: {}", e);
                 eprintln!("Using default configuration");
                 Config::default()
             }
@@ -323,6 +331,37 @@ fn load_config() -> Config {
             Config::default()
         }
     }
+}
+
+fn expand_config_vars(contents: &str) -> Result<String, String> {
+    expand_config_vars_with(contents, |name| env::var(name).ok())
+}
+
+fn expand_config_vars_with<F>(contents: &str, mut lookup: F) -> Result<String, String>
+where
+    F: FnMut(&str) -> Option<String>,
+{
+    let mut out = String::with_capacity(contents.len());
+    let mut rest = contents;
+
+    while let Some(start) = rest.find("${") {
+        out.push_str(&rest[..start]);
+        let after_open = &rest[start + 2..];
+        let end = after_open
+            .find('}')
+            .ok_or_else(|| "unterminated ${...} expression".to_string())?;
+        let name = &after_open[..end];
+        if name.is_empty() {
+            return Err("empty ${...} variable name".to_string());
+        }
+        let value =
+            lookup(name).ok_or_else(|| format!("environment variable {name} is not set"))?;
+        out.push_str(&value);
+        rest = &after_open[end + 1..];
+    }
+
+    out.push_str(rest);
+    Ok(out)
 }
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -793,4 +832,44 @@ async fn process_ordered_message(
     }
 
     1
+}
+
+#[cfg(test)]
+mod config_tests {
+    use super::*;
+
+    #[test]
+    fn expands_config_env_vars() {
+        let input = r#"
+main_port = ${DIRELERA_MAIN_PORT}
+server_id = "${DIRELERA_SERVER_ID}"
+"#;
+
+        let expanded = expand_config_vars_with(input, |name| match name {
+            "DIRELERA_MAIN_PORT" => Some("18081".to_string()),
+            "DIRELERA_SERVER_ID" => Some("local-test".to_string()),
+            _ => None,
+        })
+        .expect("config variables should expand");
+
+        let config: Config = toml::from_str(&expanded).expect("expanded TOML should parse");
+        assert_eq!(config.main_port, 18081);
+        assert_eq!(config.server_id, "local-test");
+    }
+
+    #[test]
+    fn rejects_missing_config_env_vars() {
+        let err = expand_config_vars_with("main_port = ${MISSING_PORT}", |_| None)
+            .expect_err("missing variables should fail expansion");
+
+        assert!(err.contains("MISSING_PORT"));
+    }
+
+    #[test]
+    fn rejects_unterminated_config_env_vars() {
+        let err = expand_config_vars_with("main_port = ${DIRELERA_MAIN_PORT", |_| None)
+            .expect_err("unterminated variables should fail expansion");
+
+        assert!(err.contains("unterminated"));
+    }
 }

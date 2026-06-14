@@ -1,3 +1,7 @@
+# Environment variables are expanded before TOML parsing. This works for raw
+# values and quoted strings, for example:
+#   main_port = ${DIRELERA_MAIN_PORT}
+#   server_id = "${DIRELERA_SERVER_ID}"
 main_port = 8080
 control_port = 27888
 
