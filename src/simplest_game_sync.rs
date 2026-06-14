@@ -554,36 +554,32 @@ impl CachedGameSync {
     }
 }
 
-/// L1: per-player delay buffer placed in FRONT of the combiner.
+/// L1: per-player startup delay buffer placed in FRONT of the combiner.
 ///
 /// Pipeline order (the GameCache hazard below is why this ordering matters):
-///   input-cache resolve (here) -> delay FIFO (here) -> combine + output-cache (`inner`)
+///   input-cache resolve (here) -> startup FIFO (here) -> combine + output-cache (`inner`)
 ///
-/// Each player's input is held back by its configured delay (D) frames. The same
-/// D also defines the initial zero warmup count: delay 2 means two zero replies,
-/// then input from two frames ago. This keeps the model simple for clients and
-/// debugging: advertised delay == warmup zeros == steady input delay.
+/// During startup, inputs are saved and zero frames are returned. Once warmup
+/// ends, saved startup inputs are flushed one per new packet while the current
+/// packet is discarded, matching EmuLinker's catch-up behavior. After the saved
+/// queue drains, current inputs are combined immediately.
 ///
 /// GameCache references are resolved to bytes HERE, up front, and only resolved
 /// bytes are stored in the FIFO. Resolving a *delayed* GameCache reference later (at
 /// drain time) would read a client cache whose contents have since shifted -> silent
 /// desync. So resolution must precede the delay.
 ///
-/// Steady state keeps a constant-depth-D server-side FIFO (push 1 / pop the D-old
-/// one per input).
-///
-/// A player's delay of 0 is a transparent passthrough (push then immediately pop the
-/// same input), so this layer can be inserted with D=0 before RTT-based D is wired.
+/// A player's startup delay of 0 is a transparent passthrough.
 #[derive(Debug, Clone)]
 pub struct DelayedGameSync {
     inner: CachedGameSync,
     /// Per-player client-input cache, for resolving incoming GameCache references.
     input_caches: Vec<InputCache>,
-    /// Per-player FIFO of resolved input bytes awaiting release to the combiner.
+    /// Per-player startup FIFO of resolved input bytes awaiting release.
     queues: Vec<VecDeque<Vec<u8>>>,
     /// Per-player count of warmup zero-frames already emitted.
     warmup_sent: Vec<usize>,
-    /// Per-player delay D (frames). Also the initial zero warmup count.
+    /// Per-player startup zero-frame count.
     total_delays: Vec<usize>,
     /// One player's per-frame input size, learned from the first input (zero sizing).
     /// Assumes conn=1 (one frame per packet); revisit for batched conn types.
@@ -592,13 +588,13 @@ pub struct DelayedGameSync {
 }
 
 impl DelayedGameSync {
-    /// Wrap a combiner with a D-frame warmup/delay buffer.
+    /// Wrap a combiner with a startup warmup buffer.
     pub fn new(inner: CachedGameSync, total_delay: usize) -> Self {
         let player_count = inner.player_count();
         Self::with_player_delays(inner, vec![total_delay; player_count])
     }
 
-    /// Wrap a combiner with per-player delay buffers.
+    /// Wrap a combiner with per-player startup warmup buffers.
     pub fn with_player_delays(inner: CachedGameSync, total_delays: Vec<usize>) -> Self {
         let player_count = inner.player_count();
         assert_eq!(
@@ -649,13 +645,10 @@ impl DelayedGameSync {
             self.frame_size = bytes.len();
         }
 
-        // L1: enqueue resolved bytes.
-        self.queues[player_id].push_back(bytes);
-
-        // Warmup: feed this client D zero combined-frames and hold the real
-        // inputs. After that, steady state releases the D-frames-old input.
+        // Startup warmup: save real inputs, return zero frames.
         let total_delay = self.total_delays[player_id];
         if self.warmup_sent[player_id] < total_delay {
+            self.queues[player_id].push_back(bytes);
             self.warmup_sent[player_id] += 1;
             let zero = vec![0u8; self.player_count * self.frame_size];
             return Ok((
@@ -668,13 +661,16 @@ impl DelayedGameSync {
             ));
         }
 
-        // Steady state: release the D-frames-old input into the combiner. The
-        // queue holds at least the input just pushed, so this never underflows.
-        let due = self.queues[player_id]
-            .pop_front()
-            .expect("queue holds at least the just-pushed input");
+        // Catch-up: while startup inputs remain, flush them and drop the current
+        // packet. EmuLinker does this, so lag returns to normal after startup.
+        if let Some(due) = self.queues[player_id].pop_front() {
+            return self
+                .inner
+                .process_client_input(player_id, ClientInput::GameData(due));
+        }
+
         self.inner
-            .process_client_input(player_id, ClientInput::GameData(due))
+            .process_client_input(player_id, ClientInput::GameData(bytes))
     }
 
     pub fn mark_player_dropped(
@@ -1345,6 +1341,12 @@ mod tests {
             ServerResponse::GameData(vec![3, 4]),
             "delayed by 2"
         );
+        let (o5, _, _) = d.process_client_input(0, gd(vec![9, 10])).unwrap();
+        assert_eq!(
+            o5[0].response,
+            ServerResponse::GameData(vec![9, 10]),
+            "caught up after startup inputs drain"
+        );
     }
 
     #[test]
@@ -1367,6 +1369,13 @@ mod tests {
         assert_eq!(e.len(), 2);
         assert_eq!(e[0].response, ServerResponse::GameData(vec![1, 2, 3, 4]));
         assert_eq!(e[1].response, ServerResponse::GameData(vec![1, 2, 3, 4]));
+
+        let (f, _, _) = d.process_client_input(0, gd(vec![9, 10])).unwrap();
+        assert!(f.is_empty(), "combine waits for all players");
+        let (g, _, _) = d.process_client_input(1, gd(vec![11, 12])).unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].response, ServerResponse::GameData(vec![9, 10, 11, 12]));
+        assert_eq!(g[1].response, ServerResponse::GameData(vec![9, 10, 11, 12]));
     }
 
     #[test]
@@ -1393,6 +1402,19 @@ mod tests {
         assert_eq!(
             p0_c[1].response,
             ServerResponse::GameData(vec![1, 0, 10, 0])
+        );
+
+        let (p0_d, _, _) = d.process_client_input(0, gd(vec![4, 0])).unwrap();
+        assert!(p0_d.is_empty(), "p0 released, but p1 has not sent next");
+        let (p1_c, _, _) = d.process_client_input(1, gd(vec![12, 0])).unwrap();
+        assert_eq!(p1_c.len(), 2);
+        assert_eq!(
+            p1_c[0].response,
+            ServerResponse::GameData(vec![2, 0, 12, 0])
+        );
+        assert_eq!(
+            p1_c[1].response,
+            ServerResponse::GameData(vec![2, 0, 12, 0])
         );
     }
 }

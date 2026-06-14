@@ -85,13 +85,12 @@ pub struct Config {
     #[serde(default)]
     pub same_game_delay: bool,
     /// When true, START_GAME advertises the highest ping-derived delay to every
-    /// player as the client send window, while `same_game_delay = false` can
-    /// still keep fast players on lower server-side input delay.
+    /// player. Real clients use this value as their input window, so it can add
+    /// user-visible input latency for faster players.
     #[serde(default = "default_shared_game_delay_window")]
     pub shared_game_delay_window: bool,
-    /// Safety margin added only to the shared START_GAME send window. This gives
-    /// the client pipeline enough room for scheduling variance without changing
-    /// per-player server-side input delay.
+    /// Safety margin added to the shared START_GAME delay. Because clients pace
+    /// input from START_GAME, this margin also adds user-visible input latency.
     #[serde(
         default = "default_delay_window_margin_frames",
         alias = "shared_game_delay_window_extra_frames"
@@ -276,11 +275,11 @@ fn default_metrics_push_interval() -> u64 {
 }
 
 fn default_shared_game_delay_window() -> bool {
-    true
+    false
 }
 
 fn default_delay_window_margin_frames() -> u16 {
-    2
+    0
 }
 
 fn default_main_port() -> u16 {
@@ -891,5 +890,14 @@ server_id = "${DIRELERA_SERVER_ID}"
             expand_config_vars_with("main_port = ${DIRELERA_MAIN_PORT", |_| "18081".to_string());
 
         assert_eq!(expanded, "main_port = ${DIRELERA_MAIN_PORT");
+    }
+
+    #[test]
+    fn default_game_delay_settings_match_emulinker_style_latency() {
+        let config = Config::default();
+
+        assert!(!config.same_game_delay);
+        assert!(!config.shared_game_delay_window);
+        assert_eq!(config.shared_game_delay_window_margin_frames, 0);
     }
 }

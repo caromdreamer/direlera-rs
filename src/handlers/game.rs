@@ -562,10 +562,11 @@ pub async fn handle_start_game(
 
     let disable_output_cache = state.config.disable_output_cache;
 
-    // Size one delay value per player. In this simple model, the advertised
-    // delay is also the initial zero-response count and the steady server-side
-    // input delay: D=2 means two zero replies, then two-frame-old input.
-    let (advertised_delays, sync_delays) = if let Some(delay) = state.config.fixed_game_delay {
+    // Size one delay value per player. START_GAME delay controls how far real
+    // clients run ahead, so advertised_delays are user-visible. startup_warmups
+    // model EmuLinker's initial zero/lost-input padding; after that drains,
+    // steady inputs are combined without an extra server-side FIFO delay.
+    let (advertised_delays, startup_warmups) = if let Some(delay) = state.config.fixed_game_delay {
         let d = delay as usize;
         info!(total_delay = d, "Using fixed game delay override");
         if d == 0 {
@@ -582,11 +583,10 @@ pub async fn handle_start_game(
             player_frame_delays.push(auto_game_delay_frames(ping_ms, p.conn_type));
         }
         let highest_delay = player_frame_delays.iter().copied().max().unwrap_or(1);
-        let sync_delays = if state.config.same_game_delay {
-            vec![highest_delay; players.len()]
-        } else {
-            player_frame_delays.clone()
-        };
+        let startup_warmups = player_frame_delays
+            .iter()
+            .map(|&delay| emulinker_startup_warmup_frames(highest_delay, delay))
+            .collect::<Vec<_>>();
         let shared_window_delay =
             highest_delay + state.config.shared_game_delay_window_margin_frames as usize;
         let advertised_delays =
@@ -600,10 +600,10 @@ pub async fn handle_start_game(
             shared_game_delay_window = state.config.shared_game_delay_window,
             shared_game_delay_window_margin_frames = state.config.shared_game_delay_window_margin_frames,
             advertised_delays = ?advertised_delays,
-            sync_delays = ?sync_delays,
+            startup_warmups = ?startup_warmups,
             "Sized per-player delays from ping"
         );
-        (advertised_delays, sync_delays)
+        (advertised_delays, startup_warmups)
     };
 
     // Initialize SimpleGameSync when game starts
@@ -613,7 +613,7 @@ pub async fn handle_start_game(
             .with_output_cache_disabled(disable_output_cache);
         game_info.sync_manager = Some(simplest_game_sync::DelayedGameSync::with_player_delays(
             combiner,
-            sync_delays.clone(),
+            startup_warmups.clone(),
         ));
         for (i, player) in game_info.players.iter_mut().enumerate() {
             let delay = advertised_delays
@@ -720,6 +720,12 @@ fn auto_game_delay_frames(ping_ms: u32, conn_type: u8) -> usize {
     let conn = (conn_type as f64).max(1.0);
     let frames = (GAME_FPS / conn * (ping_ms as f64 / 1000.0)).floor() as usize + 1;
     frames.max(MIN_AUTO_GAME_DELAY_FRAMES)
+}
+
+const EMULINKER_STARTUP_PADDING_FRAMES: usize = 5;
+
+fn emulinker_startup_warmup_frames(highest_delay: usize, player_delay: usize) -> usize {
+    highest_delay + highest_delay.saturating_sub(player_delay) + EMULINKER_STARTUP_PADDING_FRAMES
 }
 
 fn input_stall_grace(advertised_delay_frames: usize, conn_type: u8) -> Duration {
@@ -1103,7 +1109,7 @@ pub async fn handle_kick_user(
 
 #[cfg(test)]
 mod tests {
-    use super::auto_game_delay_frames;
+    use super::{auto_game_delay_frames, emulinker_startup_warmup_frames};
 
     #[test]
     fn auto_game_delay_allows_one_frame_floor_for_zero_ping() {
@@ -1123,5 +1129,11 @@ mod tests {
     fn auto_game_delay_respects_connection_type_cadence() {
         assert_eq!(auto_game_delay_frames(68, 2), 3);
         assert_eq!(auto_game_delay_frames(68, 3), 2);
+    }
+
+    #[test]
+    fn emulinker_startup_warmup_balances_fast_players() {
+        assert_eq!(emulinker_startup_warmup_frames(4, 4), 9);
+        assert_eq!(emulinker_startup_warmup_frames(4, 1), 12);
     }
 }
