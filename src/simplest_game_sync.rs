@@ -429,6 +429,24 @@ impl CachedGameSync {
         self
     }
 
+    fn make_cached_output(
+        &mut self,
+        player_id: usize,
+        output: Vec<u8>,
+    ) -> (ServerResponse, bool, Option<usize>) {
+        if self.disable_output_cache {
+            (ServerResponse::GameData(output), false, None)
+        } else if let Some(cache_pos) = self.output_caches[player_id].find(&output) {
+            (ServerResponse::GameCache(cache_pos), false, None)
+        } else {
+            let before = self.output_caches[player_id].len();
+            let overflowed = self.output_caches[player_id].push(output.clone());
+            let after = self.output_caches[player_id].len();
+            let milestone = (before / 64 != after / 64).then_some(after);
+            (ServerResponse::GameData(output), overflowed, milestone)
+        }
+    }
+
     /// Process client input with cache support.
     /// Returns (outputs, cache_overflowed, milestone) where:
     /// - cache_overflowed: true if any output cache eviction occurred (256+ reached)
@@ -471,29 +489,14 @@ impl CachedGameSync {
         let mut cache_overflowed = false;
         let mut milestone: Option<usize> = None;
         for raw_output in raw_outputs {
-            let cached_output = if self.disable_output_cache {
-                // Compatibility mode: always send full data, bypass the cache.
-                ServerResponse::GameData(raw_output.output)
-            } else if let Some(cache_pos) =
-                self.output_caches[raw_output.player_id].find(&raw_output.output)
-            {
-                // Found in cache - use cache reference
-                ServerResponse::GameCache(cache_pos)
-            } else {
-                // Not in cache - store and return full data
-                let before = self.output_caches[raw_output.player_id].len();
-                let overflowed =
-                    self.output_caches[raw_output.player_id].push(raw_output.output.clone());
-                let after = self.output_caches[raw_output.player_id].len();
-                if overflowed {
-                    cache_overflowed = true;
-                }
-                // Crossed a 64-entry boundary?
-                if before / 64 != after / 64 {
-                    milestone = Some(after);
-                }
-                ServerResponse::GameData(raw_output.output)
-            };
+            let (cached_output, overflowed, crossed) =
+                self.make_cached_output(raw_output.player_id, raw_output.output);
+            if overflowed {
+                cache_overflowed = true;
+            }
+            if crossed.is_some() {
+                milestone = crossed;
+            }
 
             results.push(CachedPlayerOutput {
                 player_id: raw_output.player_id,
@@ -525,19 +528,8 @@ impl CachedGameSync {
         // Convert outputs to cached responses
         let mut results = Vec::new();
         for raw_output in raw_outputs {
-            let cached_output = if self.disable_output_cache {
-                // Compatibility mode: always send full data, bypass the cache.
-                ServerResponse::GameData(raw_output.output)
-            } else if let Some(cache_pos) =
-                self.output_caches[raw_output.player_id].find(&raw_output.output)
-            {
-                // Found in cache - use cache reference
-                ServerResponse::GameCache(cache_pos)
-            } else {
-                // Not in cache - store and return full data
-                self.output_caches[raw_output.player_id].push(raw_output.output.clone());
-                ServerResponse::GameData(raw_output.output)
-            };
+            let (cached_output, _, _) =
+                self.make_cached_output(raw_output.player_id, raw_output.output);
 
             results.push(CachedPlayerOutput {
                 player_id: raw_output.player_id,
@@ -651,10 +643,11 @@ impl DelayedGameSync {
             self.queues[player_id].push_back(bytes);
             self.warmup_sent[player_id] += 1;
             let zero = vec![0u8; self.player_count * self.frame_size];
+            let (response, _, _) = self.inner.make_cached_output(player_id, zero);
             return Ok((
                 vec![CachedPlayerOutput {
                     player_id,
-                    response: ServerResponse::GameData(zero),
+                    response,
                 }],
                 false,
                 None,
@@ -1300,11 +1293,25 @@ mod tests {
         ClientInput::GameData(bytes)
     }
 
+    fn decode_client_output(cache: &mut Vec<Vec<u8>>, response: &ServerResponse) -> Vec<u8> {
+        match response {
+            ServerResponse::GameData(data) => {
+                if cache.len() >= 256 {
+                    cache.remove(0);
+                }
+                cache.push(data.clone());
+                data.clone()
+            }
+            ServerResponse::GameCache(pos) => cache[*pos as usize].clone(),
+        }
+    }
+
     #[test]
     fn test_delay_passthrough_d0() {
         // D=0 must be a transparent passthrough: input is combined immediately,
         // no warmup zeros (so the layer can be inserted before RTT-based D is wired).
-        let mut d = DelayedGameSync::new(CachedGameSync::new(vec![1]), 0);
+        let inner = CachedGameSync::new(vec![1]).with_output_cache_disabled(true);
+        let mut d = DelayedGameSync::new(inner, 0);
         let (out, _, _) = d.process_client_input(0, gd(vec![1, 2])).unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].response, ServerResponse::GameData(vec![1, 2]));
@@ -1314,7 +1321,8 @@ mod tests {
     fn test_warmup_then_delay_single_player() {
         // 1 player, D=2: first two inputs return zero frames (warmup), then output
         // is the real input delayed by exactly 2 frames.
-        let mut d = DelayedGameSync::new(CachedGameSync::new(vec![1]), 2);
+        let inner = CachedGameSync::new(vec![1]).with_output_cache_disabled(true);
+        let mut d = DelayedGameSync::new(inner, 2);
 
         let (o1, _, _) = d.process_client_input(0, gd(vec![1, 2])).unwrap();
         assert_eq!(
@@ -1350,10 +1358,65 @@ mod tests {
     }
 
     #[test]
+    fn test_warmup_outputs_stay_in_output_cache() {
+        let mut d = DelayedGameSync::new(CachedGameSync::new(vec![1]), 6);
+        let inputs = vec![
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x01, 0x00],
+            vec![0x01, 0x00],
+            vec![0x01, 0x00],
+            vec![0x02, 0x00],
+            vec![0x02, 0x00],
+            vec![0x04, 0x00],
+            vec![0x04, 0x00],
+            vec![0x04, 0x00],
+            vec![0x08, 0x00],
+            vec![0x08, 0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x10, 0x00],
+            vec![0x10, 0x00],
+        ];
+        let expected = vec![
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x01, 0x00],
+            vec![0x01, 0x00],
+            vec![0x01, 0x00],
+            vec![0x02, 0x00],
+            vec![0x00, 0x00],
+            vec![0x00, 0x00],
+            vec![0x10, 0x00],
+            vec![0x10, 0x00],
+        ];
+
+        let mut client_cache = Vec::new();
+        let mut decoded = Vec::new();
+        for input in inputs {
+            let (outputs, _, _) = d.process_client_input(0, gd(input)).unwrap();
+            assert_eq!(outputs.len(), 1);
+            decoded.push(decode_client_output(
+                &mut client_cache,
+                &outputs[0].response,
+            ));
+        }
+
+        assert_eq!(decoded, expected);
+    }
+
+    #[test]
     fn test_warmup_two_players_then_combine() {
         // 2 players, D=1. Warmup emits a zero combined-frame (size = players *
         // frame_size = 4) to each, then the combiner runs on the delayed pair.
-        let mut d = DelayedGameSync::new(CachedGameSync::new(vec![1, 1]), 1);
+        let inner = CachedGameSync::new(vec![1, 1]).with_output_cache_disabled(true);
+        let mut d = DelayedGameSync::new(inner, 1);
 
         let (a, _, _) = d.process_client_input(0, gd(vec![1, 2])).unwrap();
         assert_eq!(a[0].response, ServerResponse::GameData(vec![0, 0, 0, 0]));
@@ -1380,8 +1443,8 @@ mod tests {
 
     #[test]
     fn test_per_player_warmup_delays() {
-        let mut d =
-            DelayedGameSync::with_player_delays(CachedGameSync::new(vec![1, 1]), vec![2, 1]);
+        let inner = CachedGameSync::new(vec![1, 1]).with_output_cache_disabled(true);
+        let mut d = DelayedGameSync::with_player_delays(inner, vec![2, 1]);
 
         let (p0_a, _, _) = d.process_client_input(0, gd(vec![1, 0])).unwrap();
         assert_eq!(p0_a[0].response, ServerResponse::GameData(vec![0, 0, 0, 0]));
