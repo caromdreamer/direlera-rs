@@ -1,7 +1,7 @@
 use bytes::{Buf, BytesMut};
 use color_eyre::eyre::eyre;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 
 use super::util;
@@ -11,6 +11,8 @@ use crate::*;
 
 const GAME_FPS: f64 = 60.0;
 const MIN_AUTO_GAME_DELAY_FRAMES: usize = 1;
+const MIN_INPUT_STALL_GRACE: Duration = Duration::from_millis(250);
+const INPUT_STALL_GRACE_MARGIN: Duration = Duration::from_millis(100);
 
 // Refactored handle_create_game function
 #[tracing::instrument(skip_all)]
@@ -78,6 +80,7 @@ pub async fn handle_create_game(
             username: username.clone(),
             user_id,
             conn_type,
+            input_stall_grace: None,
             last_game_data_recv: None,
             interval_baseline_secs: None,
             left_room: false,
@@ -221,6 +224,7 @@ pub async fn handle_join_game(
                 username: username.clone(),
                 user_id,
                 conn_type,
+                input_stall_grace: None,
                 last_game_data_recv: None,
                 interval_baseline_secs: None,
                 left_room: false,
@@ -611,6 +615,15 @@ pub async fn handle_start_game(
             combiner,
             sync_delays.clone(),
         ));
+        for (i, player) in game_info.players.iter_mut().enumerate() {
+            let delay = advertised_delays
+                .get(i)
+                .copied()
+                .unwrap_or(player.conn_type as usize);
+            player.input_stall_grace = Some(input_stall_grace(delay, player.conn_type));
+            player.last_game_data_recv = None;
+            player.interval_baseline_secs = None;
+        }
         let labels = game_info.metric_labels.as_ref();
         let player_count = game_info.players.len().to_string();
         game_info.metric_handles = Some(Arc::new(GameMetricHandles {
@@ -707,6 +720,17 @@ fn auto_game_delay_frames(ping_ms: u32, conn_type: u8) -> usize {
     let conn = (conn_type as f64).max(1.0);
     let frames = (GAME_FPS / conn * (ping_ms as f64 / 1000.0)).floor() as usize + 1;
     frames.max(MIN_AUTO_GAME_DELAY_FRAMES)
+}
+
+fn input_stall_grace(advertised_delay_frames: usize, conn_type: u8) -> Duration {
+    let conn = (conn_type as f64).max(1.0);
+    let window = Duration::from_secs_f64(advertised_delay_frames as f64 * conn / GAME_FPS);
+    let grace = window + INPUT_STALL_GRACE_MARGIN;
+    if grace < MIN_INPUT_STALL_GRACE {
+        MIN_INPUT_STALL_GRACE
+    } else {
+        grace
+    }
 }
 
 /*

@@ -316,6 +316,9 @@ pub struct GamePlayerInfo {
     pub username: Vec<u8>, // Store as bytes to preserve original encoding
     pub user_id: u16,
     pub conn_type: u8,
+    /// Silence grace before stall-resend kicks in. Sized from the START_GAME send
+    /// window so normal lockstep backpressure is not treated as a stall.
+    pub input_stall_grace: Option<std::time::Duration>,
     /// Timestamp of last received input packet (game_data or cache), for pacing.
     pub last_game_data_recv: Option<std::time::Instant>,
     /// EWMA baseline of the inter-arrival interval (seconds). Self-normalizes the

@@ -23,10 +23,10 @@ const PRE_LOGIN_TIMEOUT: Duration = Duration::from_secs(15);
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(3);
 const LOGIN_ACK_RESEND_INTERVAL: Duration = Duration::from_millis(100);
 
-/// Stall recovery: if a playing client hasn't sent game input for this long, it
-/// likely missed a server->client packet (lockstep freeze). Resend its last
-/// packet so it can catch up. Checked every STALL_RESEND_INTERVAL.
-const STALL_THRESHOLD: Duration = Duration::from_millis(100);
+/// Fallback stall recovery threshold before a game has a START_GAME send window.
+/// Playing games usually install a per-player grace sized from that window, so a
+/// full client pipeline under high ping is not mistaken for a stall.
+const STALL_THRESHOLD: Duration = Duration::from_millis(250);
 const STALL_RESEND_INTERVAL: Duration = Duration::from_millis(50);
 
 /// During a PLAYING game a client streams input continuously, so going silent
@@ -268,22 +268,23 @@ pub fn start_stall_resend_task(global_state: Arc<AppState>) {
                     }
                     for (player_id, p) in game.players.iter().enumerate() {
                         // The game stays PLAYING until the last player leaves, so a
-                        // player who already dropped is still listed here with a stale
-                        // last_game_data_recv. They aren't waiting on input — resending
-                        // to them is wasted work and floods the log until they fully quit.
-                        if game
-                            .sync_manager
-                            .as_ref()
-                            .is_some_and(|m| m.is_player_dropped(player_id))
+                        // player who already left/dropped can still be listed here with
+                        // a stale last_game_data_recv. They aren't waiting on input.
+                        if p.left_room
+                            || game
+                                .sync_manager
+                                .as_ref()
+                                .is_some_and(|m| m.is_player_dropped(player_id))
                         {
                             continue;
                         }
                         if let Some(last) = p.last_game_data_recv {
                             let stalled_for = now.duration_since(last);
+                            let stall_threshold = p.input_stall_grace.unwrap_or(STALL_THRESHOLD);
                             if stalled_for >= PLAYING_INPUT_TIMEOUT {
                                 // Gone, not merely stalled: reap instead of resending.
                                 dead.push(p.addr);
-                            } else if stalled_for >= STALL_THRESHOLD {
+                            } else if stalled_for >= stall_threshold {
                                 out.push((p.addr, game.metric_labels.clone(), stalled_for));
                             }
                         }
