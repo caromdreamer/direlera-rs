@@ -89,6 +89,12 @@ pub async fn handle_client_to_server_ack(
         .await?;
 
     if ack_count > NUM_ACKS_FOR_SPEED_TEST {
+        // Some Kaillera clients treat SERVER_STATUS as the login boundary and
+        // only process lobby/welcome packets after that point. Keep the legacy
+        // order: status snapshot first, then join notification and welcome.
+        let data = util::make_server_status(src, &state).await?;
+        util::send_packet(&state, src, msg::SERVER_STATUS, data).await?;
+
         let data = util::make_user_joined(src, &state).await?;
         util::broadcast_packet(&state, msg::USER_JOINED, data).await?;
 
@@ -99,12 +105,6 @@ pub async fn handle_client_to_server_ack(
         for data in info_lines {
             util::send_packet(&state, src, msg::SERVER_INFORMATION, data).await?;
         }
-
-        // SERVER_STATUS is the login completion signal for clients. Send it last
-        // so the latest reliability bundle always contains it, even if welcome
-        // or USER_JOINED packets are also emitted during a login burst.
-        let data = util::make_server_status(src, &state).await?;
-        util::send_packet(&state, src, msg::SERVER_STATUS, data).await?;
     } else {
         // Server notification creation
         let data = packet_util::build_server_to_client_ack_packet();

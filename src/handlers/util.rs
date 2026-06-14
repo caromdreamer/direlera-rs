@@ -606,7 +606,8 @@ pub async fn make_server_status(
         })
         .collect::<Vec<_>>();
 
-    // Number of fully logged-in users (excluding self).
+    // Number of fully logged-in users, excluding self. EmuLinker sends the
+    // requesting user separately as USER_JOINED after the initial status list.
     data.put_u32_le(visible_users.len() as u32);
 
     data.put_u32_le(num_games);
@@ -735,4 +736,84 @@ where
     state
         .update_game::<_, R, color_eyre::Report>(game_id, |game_info| Ok(f(game_info)))
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kaillera::protocol::UDPPacketGenerator;
+    use crate::state::{ClientInfo, PLAYER_STATUS_IDLE};
+    use crate::{Config, Message};
+    use std::net::SocketAddr;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+    use std::time::Instant;
+    use tokio::sync::mpsc;
+    use uuid::Uuid;
+
+    fn read_cstring(data: &[u8], pos: &mut usize) -> String {
+        let start = *pos;
+        while *pos < data.len() && data[*pos] != 0 {
+            *pos += 1;
+        }
+        let s = String::from_utf8_lossy(&data[start..*pos]).to_string();
+        *pos += 1;
+        s
+    }
+
+    fn read_u32_le(data: &[u8], pos: &mut usize) -> u32 {
+        let value = u32::from_le_bytes(data[*pos..*pos + 4].try_into().unwrap());
+        *pos += 4;
+        value
+    }
+
+    fn test_client(username: &[u8], user_id: u16) -> ClientInfo {
+        ClientInfo {
+            session_id: Uuid::new_v4(),
+            username: username.to_vec(),
+            emulator_name: b"tester".to_vec(),
+            conn_type: 1,
+            user_id,
+            ping: 12,
+            player_status: PLAYER_STATUS_IDLE,
+            game_id: None,
+            last_ping_time: Some(Instant::now()),
+            ack_count: crate::handlers::NUM_ACKS_FOR_SPEED_TEST + 1,
+            ping_total: std::time::Duration::ZERO,
+            last_activity_secs: Arc::new(AtomicU64::new(0)),
+            packet_generator: UDPPacketGenerator::new(),
+            session_span: tracing::Span::none(),
+        }
+    }
+
+    #[tokio::test]
+    async fn server_status_excludes_requesting_user() {
+        let (tx, _rx) = mpsc::channel::<Message>(8);
+        let (close_tx, _close_rx) = mpsc::channel::<SocketAddr>(8);
+        let state = AppState::new(tx, close_tx, Config::default());
+        let src: SocketAddr = "127.0.0.1:10001".parse().unwrap();
+        let other: SocketAddr = "127.0.0.1:10002".parse().unwrap();
+
+        state.add_client(src, test_client(b"self", 1)).await;
+        state.add_client(other, test_client(b"other", 2)).await;
+
+        let data = make_server_status(&src, &state).await.unwrap();
+        let mut pos = 0;
+        assert_eq!(read_cstring(&data, &mut pos), "");
+        let num_users = read_u32_le(&data, &mut pos);
+        let _num_games = read_u32_le(&data, &mut pos);
+
+        let mut usernames = Vec::new();
+        for _ in 0..num_users {
+            usernames.push(read_cstring(&data, &mut pos));
+            pos += 4; // ping
+            pos += 1; // player_status
+            pos += 2; // user_id
+            pos += 1; // conn_type
+        }
+
+        assert_eq!(num_users, 1);
+        assert!(!usernames.iter().any(|name| name == "self"));
+        assert!(usernames.iter().any(|name| name == "other"));
+    }
 }
