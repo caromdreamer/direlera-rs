@@ -1,3 +1,4 @@
+use color_eyre::eyre::eyre;
 use direlera_rs::logger::{init_logger, LogFormat, LogLevel, LokiConfig};
 use packet_util::*;
 use serde::Deserialize;
@@ -303,24 +304,16 @@ fn default_welcome_message() -> String {
 }
 
 // Load configuration from config.toml
-fn load_config() -> Config {
+fn load_config() -> color_eyre::Result<Config> {
     match fs::read_to_string("config.toml") {
-        Ok(contents) => match expand_config_vars(&contents) {
-            Ok(expanded) => match toml::from_str(&expanded) {
-                Ok(config) => {
-                    eprintln!("Configuration loaded from config.toml");
-                    config
-                }
-                Err(e) => {
-                    eprintln!("Failed to parse config.toml: {}", e);
-                    eprintln!("Using default configuration");
-                    Config::default()
-                }
-            },
+        Ok(contents) => match toml::from_str(&expand_config_vars(&contents)) {
+            Ok(config) => {
+                eprintln!("Configuration loaded from config.toml");
+                Ok(config)
+            }
             Err(e) => {
-                eprintln!("Failed to expand config.toml variables: {}", e);
-                eprintln!("Using default configuration");
-                Config::default()
+                eprintln!("Failed to parse config.toml: {}", e);
+                Err(eyre!("failed to parse config.toml: {}", e))
             }
         },
         Err(_) => {
@@ -328,18 +321,18 @@ fn load_config() -> Config {
             eprintln!("Copy config.toml.example to config.toml to customize:");
             eprintln!("  cp config.toml.example config.toml");
             eprintln!("Using default configuration for now.");
-            Config::default()
+            Ok(Config::default())
         }
     }
 }
 
-fn expand_config_vars(contents: &str) -> Result<String, String> {
-    expand_config_vars_with(contents, |name| env::var(name).ok())
+fn expand_config_vars(contents: &str) -> String {
+    expand_config_vars_with(contents, |name| env::var(name).unwrap_or_default())
 }
 
-fn expand_config_vars_with<F>(contents: &str, mut lookup: F) -> Result<String, String>
+fn expand_config_vars_with<F>(contents: &str, mut lookup: F) -> String
 where
-    F: FnMut(&str) -> Option<String>,
+    F: FnMut(&str) -> String,
 {
     let mut out = String::with_capacity(contents.len());
     let mut rest = contents;
@@ -347,21 +340,21 @@ where
     while let Some(start) = rest.find("${") {
         out.push_str(&rest[..start]);
         let after_open = &rest[start + 2..];
-        let end = after_open
-            .find('}')
-            .ok_or_else(|| "unterminated ${...} expression".to_string())?;
-        let name = &after_open[..end];
-        if name.is_empty() {
-            return Err("empty ${...} variable name".to_string());
+        match after_open.find('}') {
+            Some(end) => {
+                let name = &after_open[..end];
+                out.push_str(&lookup(name));
+                rest = &after_open[end + 1..];
+            }
+            None => {
+                out.push_str(&rest[start..]);
+                return out;
+            }
         }
-        let value =
-            lookup(name).ok_or_else(|| format!("environment variable {name} is not set"))?;
-        out.push_str(&value);
-        rest = &after_open[end + 1..];
     }
 
     out.push_str(rest);
-    Ok(out)
+    out
 }
 #[tokio::main]
 async fn main() -> color_eyre::Result<()> {
@@ -371,7 +364,7 @@ async fn main() -> color_eyre::Result<()> {
         .theme(color_eyre::config::Theme::new())
         .install()?;
     // Load configuration from config.toml
-    let config = load_config();
+    let config = load_config()?;
 
     // Parse log level
     let log_level = match config.tracing.level.to_lowercase().as_str() {
@@ -846,11 +839,10 @@ server_id = "${DIRELERA_SERVER_ID}"
 "#;
 
         let expanded = expand_config_vars_with(input, |name| match name {
-            "DIRELERA_MAIN_PORT" => Some("18081".to_string()),
-            "DIRELERA_SERVER_ID" => Some("local-test".to_string()),
-            _ => None,
-        })
-        .expect("config variables should expand");
+            "DIRELERA_MAIN_PORT" => "18081".to_string(),
+            "DIRELERA_SERVER_ID" => "local-test".to_string(),
+            _ => String::new(),
+        });
 
         let config: Config = toml::from_str(&expanded).expect("expanded TOML should parse");
         assert_eq!(config.main_port, 18081);
@@ -858,18 +850,46 @@ server_id = "${DIRELERA_SERVER_ID}"
     }
 
     #[test]
-    fn rejects_missing_config_env_vars() {
-        let err = expand_config_vars_with("main_port = ${MISSING_PORT}", |_| None)
-            .expect_err("missing variables should fail expansion");
+    fn expands_config_env_vars_in_comments_without_affecting_toml() {
+        let input = r#"
+# Example:
+#   main_port = ${DIRELERA_MAIN_PORT}
+main_port = 18081
+"#;
 
-        assert!(err.contains("MISSING_PORT"));
+        let expanded = expand_config_vars_with(input, |_| String::new());
+
+        assert!(expanded.contains("#   main_port = "));
+        let config: Config = toml::from_str(&expanded).expect("expanded TOML should parse");
+        assert_eq!(config.main_port, 18081);
     }
 
     #[test]
-    fn rejects_unterminated_config_env_vars() {
-        let err = expand_config_vars_with("main_port = ${DIRELERA_MAIN_PORT", |_| None)
-            .expect_err("unterminated variables should fail expansion");
+    fn expands_config_env_vars_on_non_comment_lines() {
+        let input = r#"
+server_id = "${DIRELERA_SERVER_ID}"
+"#;
 
-        assert!(err.contains("unterminated"));
+        let expanded = expand_config_vars_with(input, |name| match name {
+            "DIRELERA_SERVER_ID" => "local-test".to_string(),
+            _ => String::new(),
+        });
+
+        assert!(expanded.contains("server_id = \"local-test\""));
+    }
+
+    #[test]
+    fn missing_config_env_vars_expand_to_empty() {
+        let expanded = expand_config_vars_with("server_id = \"${MISSING_ID}\"", |_| String::new());
+
+        assert_eq!(expanded, "server_id = \"\"");
+    }
+
+    #[test]
+    fn leaves_unterminated_config_env_vars_for_parser() {
+        let expanded =
+            expand_config_vars_with("main_port = ${DIRELERA_MAIN_PORT", |_| "18081".to_string());
+
+        assert_eq!(expanded, "main_port = ${DIRELERA_MAIN_PORT");
     }
 }
