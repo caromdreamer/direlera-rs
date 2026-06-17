@@ -27,6 +27,22 @@ Direlera-rs is an experimental attempt to reimplement the Kaillera server protoc
 - Wireshark protocol dissector (Lua)
 - EUC-KR encoding support
 
+## Why Run direlera-rs?
+
+direlera-rs is built for small, low-overhead Kaillera hosting with a modern,
+maintainable Rust codebase. In local `kaillera-tester observe` runs, it kept
+game-output cadence near 60 fps while using much less memory than EmuLinker-K:
+
+| server | 4 concurrent games | peak RSS | avg CPU | game cadence |
+| --- | ---: | ---: | ---: | ---: |
+| direlera-rs | 8/8 completed | 15.02 MiB | 4.25% | ~60 fps |
+| EmuLinker-K | 8/8 completed | 247.56 MiB | 13.65% | ~60 fps |
+| original kaillerasrv 0.86 | 8/8 completed | 2.02 MiB | 3.06% | ~60 fps |
+
+The original 2002 `kaillerasrv` is still extremely small, but it is a legacy
+32-bit binary. See [PERFORMANCE.md](PERFORMANCE.md) for the measurement method
+and an important note about using `cadence_fps` for FPS comparisons.
+
 ## Getting Started
 
 ### Option 1: Simple Linux Install
@@ -203,28 +219,6 @@ The server listens on the following ports by default:
 For a public server, open at least UDP `27888` and UDP `8080` on your firewall or
 cloud security group.
 
-## Smoke Test
-
-After the server is running, a real client should be able to see the server on
-`27888/udp` and then continue on the advertised main port. For a quick local
-check from this repository, use the tester project in the parent workspace:
-
-```bash
-cd ../kaillera-tester
-go run . -server 127.0.0.1:8080 -user smoke -conn 1 -idle 1
-```
-
-Expected result: login succeeds, the user receives `USER_JOINED`, and the tester
-quits after the idle timeout.
-
-To confirm the LAN-only policy:
-
-```bash
-go run . -server 127.0.0.1:8080 -user nonlan -conn 2 -idle 1
-```
-
-Expected result: login is rejected with `Only LAN connection type is allowed.`
-
 ## Wireshark Dissector Setup
 
 The included Wireshark dissector allows you to analyze Kaillera protocol packets.
@@ -272,15 +266,10 @@ For a detailed explanation of the Kaillera game synchronization protocol, includ
 
 See **[GAME_SYNC_PROTOCOL.md](GAME_SYNC_PROTOCOL.md)** - This document describes the actual protocol behavior discovered through reverse engineering and packet analysis with Wireshark.
 
-## Contributing
+## Feedback
 
-Contributions are welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for details.
-
-Quick summary:
-
-1. Check existing issues or create a new one
-2. Create a feature branch from the `develop` branch
-3. Commit your changes and submit a PR to the `develop` branch
+This project is still experimental. Please report bugs, compatibility problems,
+or server operation issues on [GitHub Issues](https://github.com/caromdreamer/direlera-rs/issues).
 
 ## License
 
@@ -291,7 +280,3 @@ This project is licensed under the terms specified in the [LICENSE](LICENSE) fil
 - [Kaillera Official Website](http://www.kaillera.com/)
 - [EmuLinker-K](https://github.com/hopskipnfall/EmuLinker-K) - Similar Kotlin implementation
 - [Protocol Documentation](protocol.txt) - Detailed Kaillera protocol documentation
-
-## Contact
-
-Please report bugs or feature requests on [GitHub Issues](https://github.com/caromdreamer/direlera-rs/issues).
