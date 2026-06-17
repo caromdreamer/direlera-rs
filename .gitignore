@@ -1,3 +1,5 @@
 /target
 .cursor/*
 /config.toml
+/direlera.log
+/direlera.pid

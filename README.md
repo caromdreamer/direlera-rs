@@ -29,26 +29,46 @@ Direlera-rs is an experimental attempt to reimplement the Kaillera server protoc
 
 ## Getting Started
 
-### Option 1: Download Pre-built Binary (Recommended — No Rust needed)
+### Option 1: Simple Linux Install
 
-Download the latest binary directly from the [Releases page](https://github.com/yourusername/direlera-rs/releases) and run it:
+This path does not require Docker. It is meant for a basic Ubuntu or Debian VPS.
+Copy and paste the commands in order.
 
 ```bash
-# Download (replace vX.Y.Z with the latest version)
-wget https://github.com/yourusername/direlera-rs/releases/download/vX.Y.Z/direlera-rs-linux-x86_64.tar.gz
-tar -xzf direlera-rs-linux-x86_64.tar.gz
+sudo apt update
+sudo apt install -y curl git build-essential
+
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+source "$HOME/.cargo/env"
+
+git clone https://github.com/caromdreamer/direlera-rs.git
 cd direlera-rs
-./direlera-rs
+cp config.toml.example config.toml
+./start.sh --build
 ```
 
----
+The server keeps running in the background. Logs are written to `direlera.log`.
 
-### Option 2: Build from Source
+Stop the server:
 
-If no pre-built binary is available for your platform, or you prefer to build yourself, follow the steps below.
-You do **not** need any prior Rust knowledge — just copy and paste the commands.
+```bash
+./stop.sh
+```
 
-#### Step 1 — Install system dependencies
+Update later:
+
+```bash
+cd direlera-rs
+./stop.sh
+git pull
+./start.sh --build
+```
+
+### Option 2: Build from Source Manually
+
+Use this path when you are not on Ubuntu/Debian or want each step separated.
+
+#### Step 1: Install system dependencies
 
 **Ubuntu / Debian:**
 
@@ -69,7 +89,7 @@ sudo dnf install -y curl git gcc
 sudo pacman -S --needed curl git base-devel
 ```
 
-#### Step 2 — Install the Rust toolchain
+#### Step 2: Install Rust
 
 Rust is installed through a tool called `rustup`. Run the following command, press **Enter** when prompted, and let the installer finish:
 
@@ -89,30 +109,121 @@ Verify the installation:
 cargo --version   # should print something like: cargo 1.XX.X
 ```
 
-#### Step 3 — Clone and build
+#### Step 3: Clone, configure, and build
 
 ```bash
-git clone https://github.com/yourusername/direlera-rs.git
+git clone https://github.com/caromdreamer/direlera-rs.git
 cd direlera-rs
+cp config.toml.example config.toml
 cargo build --release
 ```
 
 The build may take a few minutes on the first run. When it finishes, the binary is at `target/release/direlera-rs`.
 
-#### Step 4 — Run the server
+#### Step 4: Run the server
 
 ```bash
-./target/release/direlera-rs
+./start.sh
 ```
 
----
+Stop it later:
 
-### Default Ports
+```bash
+./stop.sh
+```
+
+### Option 3: Docker
+
+Docker is optional. Skip this section unless you already know you want to use
+Docker.
+
+Run the published image with Docker Compose:
+
+```bash
+git clone https://github.com/caromdreamer/direlera-rs.git
+cd direlera-rs
+cp config.toml.example config.toml
+docker compose up -d
+docker compose logs -f direlera
+```
+
+Build a local image instead:
+
+```bash
+docker build -t direlera-rs:local .
+docker run --rm \
+  -p 8080:8080/udp \
+  -p 27888:27888/udp \
+  -p 9091:9091 \
+  -v "$PWD/config.toml:/app/config.toml:ro" \
+  direlera-rs:local
+```
+
+## Configuration
+
+The server reads `config.toml` from the current working directory. Start from
+`config.toml.example` and edit only the settings you need.
+
+Most server owners should review these first:
+
+| Config key | Default | Meaning |
+| --- | --- | --- |
+| `main_port` | `8080` | Main Kaillera UDP port used after the initial handshake. |
+| `control_port` | `27888` | Kaillera discovery, ping, and initial connection UDP port. |
+| `welcome_message` | example text | Message shown to clients when they connect. |
+| `disable_output_cache` | `false` | Send full `GAME_DATA` instead of cache references for maximum client compatibility. |
+| `metrics_enabled` | `false` | Expose Prometheus metrics on `metrics_port`. |
+| `master_list.enabled` | `false` | Announce the server to configured public master lists. |
+| `master_list.server_name` | example text | Server name shown on master lists. |
+| `master_list.server_location` | `US` | Short location code shown on master lists. |
+| `tracing.level` | `info` | Log level. Use `debug` or `trace` only while troubleshooting. |
+
+Environment variables can be used in `config.toml`:
+
+```toml
+main_port = ${DIRELERA_MAIN_PORT}
+server_id = "${DIRELERA_SERVER_ID}"
+```
+
+### LAN-only connection policy
+
+direlera-rs currently accepts only Kaillera connection type `1` (`LAN`). Clients
+that try to log in with `2` through `6` are rejected before they enter the
+lobby. This keeps the current server behavior simple and predictable while the
+sync model is being hardened.
+
+## Ports
 
 The server listens on the following ports by default:
 
-- **Control Port**: 27888 UDP (initial connection and ping)
-- **Game Port**: 8080 UDP (game logic)
+- `27888/udp`: control/discovery/ping port. Most Kaillera clients start here.
+- `8080/udp`: main game/lobby protocol port returned by the control handshake.
+- `9091/tcp`: optional Prometheus metrics endpoint when `metrics_enabled = true`.
+
+For a public server, open at least UDP `27888` and UDP `8080` on your firewall or
+cloud security group.
+
+## Smoke Test
+
+After the server is running, a real client should be able to see the server on
+`27888/udp` and then continue on the advertised main port. For a quick local
+check from this repository, use the tester project in the parent workspace:
+
+```bash
+cd ../kaillera-tester
+go run . -server 127.0.0.1:8080 -user smoke -conn 1 -idle 1
+```
+
+Expected result: login succeeds, the user receives `USER_JOINED`, and the tester
+quits after the idle timeout.
+
+To confirm the LAN-only policy:
+
+```bash
+go run . -server 127.0.0.1:8080 -user nonlan -conn 2 -idle 1
+```
+
+Expected result: login is rejected with `Only LAN connection type is allowed.`
 
 ## Wireshark Dissector Setup
 
@@ -178,9 +289,9 @@ This project is licensed under the terms specified in the [LICENSE](LICENSE) fil
 ## References
 
 - [Kaillera Official Website](http://www.kaillera.com/)
-- [EmuLinker-K](https://github.com/sysfce2/EmuLinker-K) - Similar Kotlin implementation
+- [EmuLinker-K](https://github.com/hopskipnfall/EmuLinker-K) - Similar Kotlin implementation
 - [Protocol Documentation](protocol.txt) - Detailed Kaillera protocol documentation
 
 ## Contact
 
-Please report bugs or feature requests on [GitHub Issues](https://github.com/yourusername/direlera-rs/issues).
+Please report bugs or feature requests on [GitHub Issues](https://github.com/caromdreamer/direlera-rs/issues).
