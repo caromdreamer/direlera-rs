@@ -6,6 +6,7 @@ use tracing::{info, warn};
 use uuid::Uuid;
 
 const SESSION_ALIVE_THRESHOLD_SECS: u64 = 30;
+const LAN_CONNECTION_TYPE: u8 = 1;
 
 use super::util;
 use crate::kaillera::message_types as msg;
@@ -27,6 +28,15 @@ pub async fn handle_user_login(
     let emulator_name = util::read_string_bytes(&mut buf);
     // 1B: Connection Type
     let conn_type = if !buf.is_empty() { buf.get_u8() } else { 0 };
+
+    if conn_type != LAN_CONNECTION_TYPE {
+        warn!(
+            conn_type,
+            "Login rejected: only LAN connection type is allowed"
+        );
+        reject_login(state.as_ref(), src, b"Only LAN connection type is allowed.").await;
+        return Ok(());
+    }
 
     // Validate username length (31 bytes max - not characters, to preserve encoding)
     if username.len() > 31 {
@@ -58,20 +68,7 @@ pub async fn handle_user_login(
             // failure — it just times out). This is the first and only server reply
             // to the not-yet-registered login attempt, so build it with a fresh
             // generator (sequence starts at 0, like the normal ACK would).
-            let mut gen = kaillera::protocol::UDPPacketGenerator::new();
-            let body = packet_util::build_connection_rejected_packet(
-                b"server",
-                0,
-                b"Username is already in use.",
-            );
-            let datagram = gen.make_send_packet(msg::CONNECTION_REJECTED, body);
-            let _ = state
-                .tx
-                .send(crate::Message {
-                    data: datagram,
-                    addr: *src,
-                })
-                .await;
+            reject_login(state.as_ref(), src, b"Username is already in use.").await;
             return Ok(());
         }
 
@@ -151,6 +148,19 @@ pub async fn handle_user_login(
     util::send_packet(&state, src, msg::SERVER_TO_CLIENT_ACK, data).await?;
     util::record_processing_time("user_login", start.elapsed());
     Ok(())
+}
+
+async fn reject_login(state: &AppState, src: &std::net::SocketAddr, message: &[u8]) {
+    let mut gen = kaillera::protocol::UDPPacketGenerator::new();
+    let body = packet_util::build_connection_rejected_packet(b"server", 0, message);
+    let datagram = gen.make_send_packet(msg::CONNECTION_REJECTED, body);
+    let _ = state
+        .tx
+        .send(crate::Message {
+            data: datagram,
+            addr: *src,
+        })
+        .await;
 }
 
 /*
