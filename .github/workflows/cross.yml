@@ -52,7 +52,8 @@ jobs:
 
           mkdir -p "$PKG_DIR"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}${BIN_EXT}" "$PKG_DIR/"
-          cp config.toml LICENSE README.md "$PKG_DIR/"
+          cp config.toml.example "$PKG_DIR/config.toml"
+          cp config.toml.example LICENSE README.md start.sh stop.sh "$PKG_DIR/"
 
           if [[ "${{ matrix.target }}" == *windows* ]]; then
             7z a "$ARCHIVE" "$PKG_DIR"
