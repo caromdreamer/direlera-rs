@@ -28,6 +28,8 @@ Direlera-rs is an experimental attempt to reimplement the Kaillera server protoc
 - EUC-KR encoding support
 
 ## Why Run direlera-rs?
+Looking for rollback-style classic arcade netplay rather than a traditional Kaillera server?
+See [Kaileron](https://kaileron.funnify.org/).
 
 direlera-rs is built for small, low-overhead Kaillera hosting with a modern,
 maintainable Rust codebase. In local `kaillera-tester observe` runs, it kept
